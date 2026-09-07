@@ -12,7 +12,7 @@ from typing import Literal
 import torch
 import torch._inductor.config
 from torchtitan.components.quantization import QuantizationConverter
-from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.linear import Linear, RouterGateLinear
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
@@ -155,6 +155,11 @@ class Float8LinearConverter(QuantizationConverter):
         assert Float8Linear is not None
         for fqn, linear_config, parent, attr in model_config.traverse(Linear.Config):
             if self.filter_fn(linear_config, fqn):
+                if isinstance(linear_config, RouterGateLinear.Config):
+                    raise ValueError(
+                        f"Float8 quantization does not support router gate {fqn!r}; "
+                        "exclude it with filter_fqns."
+                    )
                 new_config = Float8Linear.Config(
                     in_features=linear_config.in_features,
                     out_features=linear_config.out_features,
@@ -198,13 +203,16 @@ def _get_float8_grouped_experts_cls(parent_cls: type) -> type:
 
             self._float8_op_config = Float8TrainingOpConfig()
 
-        def _grouped_mm(self, *, A, B_t, offs):
+        def _grouped_mm(self, *, A, weight_EOI, offs):
             from torchao.prototype.moe_training.utils import (
                 _quantize_then_scaled_grouped_mm,
             )
 
             return _quantize_then_scaled_grouped_mm(
-                A, B_t, config=self._float8_op_config, offs=offs
+                A,
+                weight_EOI.bfloat16().transpose(-2, -1),
+                config=self._float8_op_config,
+                offs=offs,
             )
 
     Float8GroupedExperts.__name__ = f"Float8{parent_cls.__name__}"
