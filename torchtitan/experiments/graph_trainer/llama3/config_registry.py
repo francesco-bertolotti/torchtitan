@@ -30,7 +30,7 @@ from . import model_registry
 
 
 def graph_trainer_llama3_debugmodel() -> GraphTrainer.Config:
-    config = to_graph_trainer_config(llama3_debugmodel(seq_len=2048), model_registry)
+    config = to_graph_trainer_config(llama3_debugmodel(), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
     return config
 
@@ -50,11 +50,10 @@ def graph_trainer_llama3_debugmodel_dist_gemm() -> GraphTrainer.Config:
 
     The point of running dist-GEMM here rather than only under the eager trainer:
     GraphTrainer traces the whole model, so this is what proves the fused autograd
-    Functions survive tracing. Needs tensor_parallel_degree > 1 and CUDA; the base
-    config pins spmd_backend to spmd_types.
+    Functions survive tracing. Needs tensor_parallel_degree > 1 and CUDA.
     """
     config = to_graph_trainer_config(
-        llama3_debugmodel_dist_gemm(seq_len=2048),
+        llama3_debugmodel_dist_gemm(),
         partial(model_registry, tp_gemm_backend="dist_gemm"),
     )
     config.compile = GraphTrainerCompileConfig(enable=True)
@@ -65,6 +64,7 @@ def graph_trainer_llama3_debugmodel_mxfp8() -> GraphTrainer.Config:
     base = llama3_debugmodel()
     base.model_spec = llama3_model_registry(
         "debugmodel",
+        seq_len=base.training.max_context_length,
         converters=[
             llama3_mxfp8_linear_converter_config(model_compile_enabled=True),
         ],
@@ -78,12 +78,12 @@ def graph_trainer_llama3_debugmodel_sdpa() -> GraphTrainer.Config:
     """Debug model on the test-only SDPA backend.
 
     Used by graph machinery tests (precompile artifact serialization, context
-    parallel) that can't run on the default FlexAttention backend: its BlockMask
+    parallel) that can't run on the default FlexInnerAttention backend: its BlockMask
     is unpicklable (mask_mod code objects) and is not a tensor. SDPA exercises
     the same machinery without those obstacles. See
     ``build_decoder_config_for_backend``.
     """
-    base = llama3_debugmodel(seq_len=2048)
+    base = llama3_debugmodel()
     base.parallelism.context_parallel_load_balancer = "headtail"
     base.model_spec = model_registry(
         "debugmodel",
@@ -111,7 +111,7 @@ def graph_trainer_llama3_debugmodel_sdpa_eager() -> GraphTrainer.Config:
     Serves as the eager reference for the AutoParallel SDPA loss-compare test:
     with ``mode=None`` GraphTrainer.forward_backward_step delegates to the core
     (eager) Trainer path, so this is a plain eager FSDP+TP run of the same SDPA
-    model the AutoParallel test traces. The default FlexAttention backend can't
+    model the AutoParallel test traces. The default FlexInnerAttention backend can't
     fill this role — flex + AutoParallel is unsupported (BlockMask flattening).
     """
     config = graph_trainer_llama3_debugmodel_sdpa()

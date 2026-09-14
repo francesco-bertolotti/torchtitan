@@ -28,7 +28,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.config import CompileConfig, OverrideConfig, ParallelismConfig
@@ -76,9 +76,6 @@ class InferenceParallelismConfig:
     enable_sequence_parallel: bool = False
     """Enable dense sequence parallelism across the tensor-parallel axis."""
 
-    spmd_backend: Literal["partial_dtensor", "spmd_types"] = "spmd_types"
-    """SPMD backend used by TorchTitan model parallelization in the generator."""
-
     @property
     def expert_sequence_parallel_size(self) -> int:
         """TP-axis shard count used internally by expert-parallel MoE."""
@@ -107,7 +104,6 @@ class InferenceParallelismConfig:
             context_parallel_degree=1,
             pipeline_parallel_degree=1,
             enable_sequence_parallel=self.enable_sequence_parallel,
-            spmd_backend=self.spmd_backend,
         )
 
 
@@ -138,6 +134,8 @@ def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
     n_heads = attn.n_heads
     n_kv_heads = attn.n_kv_heads or n_heads
     head_dim = attn.head_dim if attn.head_dim is not None else cfg.dim // n_heads
+    rope = getattr(attn, "rope", None)
+    rope_theta = None if rope is None else rope.theta
 
     hf: dict[str, Any] = {
         # Value used
@@ -147,14 +145,14 @@ def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
         "num_attention_heads": n_heads,  # TP divisibility + FA3 num_heads_q
         "num_key_value_heads": n_kv_heads,  # DCP divisibility + FA3 num_heads_kv
         "head_dim": head_dim,  # FA3 scheduler headdim
-        "max_position_embeddings": attn.rope.max_context_length,  # caps max_model_len
+        "max_position_embeddings": spec.max_context_length,  # caps max_model_len
         # Presence required
         "model_type": "torchtitan",  # any non-empty string
         "num_hidden_layers": len(
             cfg.layers
         ),  # positive int; only PP/KV-transfer read magnitude
         # Unused
-        "rope_theta": attn.rope.theta,  # only used for non-default rope_type; wrapper builds RoPE
+        "rope_theta": rope_theta,  # only used for non-default rope_type; wrapper builds RoPE
         "rms_norm_eps": cfg.norm.eps,  # only minimax-qk-norm fusion reads it; wrapper builds RMSNorm
         "tie_word_embeddings": getattr(
             cfg, "enable_weight_tying", False
@@ -164,8 +162,8 @@ def model_spec_to_hf_config_dict(spec: ModelSpec) -> dict[str, Any]:
     }
 
     if ffn is not None:
-        # Unused: only v1/metrics/perf.py reads it (off by default). SwiGLU hidden == w1.out_features.
-        hf["intermediate_size"] = ffn.w1.out_features
+        # Unused: only v1/metrics/perf.py reads it (off by default).
+        hf["intermediate_size"] = ffn.w13.out_features // 2
 
     if moe is not None:
         # Presence required: >0 toggles MoE/EP branches.

@@ -9,7 +9,6 @@ from dataclasses import replace
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import GrainDataLoader, SingleDatasetConfig
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.tokenizer import MultiModalTokenizer
 
@@ -20,7 +19,11 @@ from torchtitan.hf_datasets.multimodal.mm_datasets import (
     MM_DATASETS,
     MultiModalProcessor,
 )
-from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.config_utils import (
+    decoder_vocab_size,
+    DEFAULT_DEBUG_MODEL_SEQ_LEN,
+)
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
 
 from . import model_registry, QWEN3_5_SPECIAL_TOKENS
@@ -39,7 +42,9 @@ def _multimodal_collator_config(
     )
 
 
-def qwen35_debugmodel(seq_len: int | None = None) -> Trainer.Config:
+def qwen35_debugmodel(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
     model_spec = model_registry("debugmodel", seq_len=seq_len)
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
@@ -76,7 +81,9 @@ def qwen35_debugmodel(seq_len: int | None = None) -> Trainer.Config:
     )
 
 
-def qwen35_debugmodel_varlen_attn(seq_len: int | None = None) -> Trainer.Config:
+def qwen35_debugmodel_varlen_attn(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
     config = qwen35_debugmodel(seq_len=seq_len)
     config.model_spec = model_registry(
         "debugmodel", seq_len=seq_len, attn_backend="varlen"
@@ -85,7 +92,9 @@ def qwen35_debugmodel_varlen_attn(seq_len: int | None = None) -> Trainer.Config:
     return config
 
 
-def qwen35_debugmodel_moe(seq_len: int | None = None) -> Trainer.Config:
+def qwen35_debugmodel_moe(
+    seq_len: int | None = DEFAULT_DEBUG_MODEL_SEQ_LEN,
+) -> Trainer.Config:
     model_spec = model_registry(
         "debugmodel_moe", seq_len=seq_len, moe_comm_backend="standard"
     )
