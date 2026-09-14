@@ -361,6 +361,23 @@ class DebugConfig:
     seed: int | None = None
     """Choose the base RNG seed used for training"""
 
+    distinct_seed_mesh_dims: list[str] = field(default_factory=lambda: ["pp"])
+    """Mesh axes whose ranks each get a distinct RNG seed.
+
+    Weight init that runs on CPU (training.enable_cpu_offload or
+    checkpoint.create_seed_checkpoint) gets no per-shard RNG offset from
+    DTensor: is_rng_supported_mesh() is False for CPU, so random._rng_tracker
+    is never constructed and the local op falls back to the global default
+    generator. Every FSDP shard then draws identical values and the
+    all-gathered parameter is its own shard repeated once per shard rank --
+    for an MoE router gate that makes the score rows periodic, so topk returns
+    the same experts for every token. List the FSDP sharding axes here (e.g.
+    ["pp", "dp_shard"]) whenever init runs on CPU.
+
+    Only sharding axes belong here: dp_replicate and tp carry replicated
+    parameters that must stay bit-identical across ranks.
+    """
+
     spmd_typechecking: bool = False
     """Enable global SPMD type checking."""
 
