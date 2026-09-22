@@ -87,6 +87,42 @@ class IndexedJsonlSource(Configurable):
             return json.loads(file.readline())
 
 
+class ArrowDiskSource(Configurable):
+    """Provides random access to an Arrow dataset written by `save_to_disk`.
+
+    Unlike the Hugging Face sources this never calls `load_dataset`, so there is
+    no builder cache to (re)generate and no lock for the ranks to serialize on
+    at startup: `load_from_disk` memory-maps shards that are already on disk, so
+    the ranks on a node share one page cache instead of each materializing the
+    dataset. Build the directory with `scripts/parquet2arrow.py`.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        path: str
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        dataset_iteration_policy: DatasetIterationPolicy,
+    ) -> None:
+        del dataset_iteration_policy
+        dataset = datasets.load_from_disk(config.path)
+        if not isinstance(dataset, datasets.Dataset):
+            raise TypeError(
+                "arrow-disk source requires one Dataset; "
+                f"got {type(dataset).__qualname__}"
+            )
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self._dataset[index]
+
+
 class HuggingFaceRandomAccessSource(Configurable):
     """Provides random access to a materialized Hugging Face dataset."""
 
