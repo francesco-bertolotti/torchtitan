@@ -397,3 +397,6 @@ class DebugConfig:
     ``torchtitan.observability.structured_logger``). When False, all
     ``log_trace_span`` / ``log_trace_instant`` / ``log_trace_scalar`` calls
     are no-ops. Disable to fully eliminate trace overhead."""
+
+    distinct_seed_mesh_dims: list[str] = field(default_factory=lambda: ["pp"])
+    """List of mesh dimensions that should have distinct seeds"""
