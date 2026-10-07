@@ -9,6 +9,7 @@
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, cast
 
@@ -31,6 +32,9 @@ from torchtitan.protocols.module import Module
 
 
 logger = logging.getLogger(__name__)
+
+_PackHook = Callable[[torch.Tensor], object]
+_UnpackHook = Callable[[object], torch.Tensor]
 
 
 def _get_default_save_ops() -> set:
@@ -339,6 +343,12 @@ class RegionAC(ActivationCheckpointing):
                     "RegionAC does not support the activation checkpoint debug option."
                 )
 
+    def get_saved_tensors_hooks(
+        self, module: nn.Module, *, base_fqn: str | None
+    ) -> tuple[_PackHook, _UnpackHook] | None:
+        """Return the saved-tensor hook pair for one transformer block, or None."""
+        return None
+
     def _wrap_block(
         self, module: nn.Module, *, base_fqn: str | None = None
     ) -> nn.Module:
@@ -348,6 +358,7 @@ class RegionAC(ActivationCheckpointing):
             region_name=checkpoint_region_name,
             determinism_check=config.determinism_check,
             preserve_rng_state=False,
+            saved_tensors_hooks=self.get_saved_tensors_hooks(module, base_fqn=base_fqn),
         )(module.forward)
         module.forward = checkpointed_forward
         return module
