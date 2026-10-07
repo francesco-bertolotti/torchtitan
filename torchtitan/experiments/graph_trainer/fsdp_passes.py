@@ -27,7 +27,12 @@ from torch._dynamo.graph_deduplication import _stable_topological_sort
 from torch._inductor.fx_passes.bucketing import (
     BucketMode,
     is_all_gather_into_tensor as is_all_gather,
+    is_all_reduce_tensor,
+    is_reduce_scatter_tensor,
     is_wait_tensor,
+    merge_all_gather_bucket,
+    merge_all_reduce_bucket,
+    merge_reduce_scatter_bucket,
 )
 
 try:
@@ -50,10 +55,15 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _is_backward_node,
     _MODULE_FQN,
 )
+from torchtitan.experiments.graph_trainer.ep_pass_utils import (
+    _chunk_owner,
+    _clear_chunk_ownership,
+)
 from torchtitan.experiments.graph_trainer.fsdp_patterns import (
     annotate_fsdp_unshard_outputs,
     find_fsdp_unshard_outputs_by_param,
 )
+from torchtitan.experiments.graph_trainer.mutation_utils import mutation_target_nodes
 from torchtitan.experiments.graph_trainer.simple_fsdp import FSDP_PARAM_FQNS_META
 
 
@@ -93,6 +103,11 @@ def deduplicate_fsdp_unshard_chains_pass(
     collective infrastructure. It then annotates the canonical unshard
     boundaries so later collective bucketing can replace the launch/wait nodes
     without hiding the parameter reconstruction chain from downstream passes.
+
+    When deduplication makes one unshard chain serve multiple EP chunks, remove
+    its chunk ownership so EP scheduling treats it as shared infrastructure.
+    Prefer an output with consumers because dead-code elimination intentionally
+    retains effectful collectives after removing their unused preparation tail.
     """
     del example_inputs
 
@@ -103,13 +118,24 @@ def deduplicate_fsdp_unshard_chains_pass(
     for placeholder, unshard_outputs in outputs_by_param.items():
         if len(unshard_outputs) <= 1:
             continue
-        canonical_output = unshard_outputs[0]
-        for duplicate_output in unshard_outputs[1:]:
+        live_outputs = tuple(output for output in unshard_outputs if output.users)
+        canonical_output = live_outputs[0] if live_outputs else unshard_outputs[0]
+        shared_across_chunk_scopes = (
+            len({_chunk_owner(output) for output in live_outputs}) > 1
+        )
+        for duplicate_output in unshard_outputs:
+            if duplicate_output is canonical_output:
+                continue
             removable_nodes.update(
                 _chain_nodes_to_placeholder(duplicate_output, placeholder)
             )
-            duplicate_output.replace_all_uses_with(canonical_output)
+            if duplicate_output.users:
+                duplicate_output.replace_all_uses_with(canonical_output)
             num_duplicate_chains += 1
+        if shared_across_chunk_scopes:
+            _clear_chunk_ownership(
+                _chain_nodes_to_placeholder(canonical_output, placeholder)
+            )
 
     if num_duplicate_chains:
 
@@ -344,6 +370,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]],
         bucket_mode: BucketMode | None = None,
         fsdp_param_module_order: dict[str, int] | None = None,
+        should_bucket_collective: Callable[[fx.Node], bool] | None = None,
     ) -> None:
         super().__init__(
             gm,
@@ -354,9 +381,16 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         )
         self._is_backward_fn = is_backward_fn
         effective_bucket_mode = self.bucketer.bucket_mode
+        collective_info = self.collective_info
+        if should_bucket_collective is not None:
+            collective_info = {
+                node: info
+                for node, info in collective_info.items()
+                if should_bucket_collective(node)
+            }
         self.bucketer = FSDPParamOrderBucketer(
             graph=self.graph,
-            collective_info=self.collective_info,
+            collective_info=collective_info,
             scheduled=OrderedSet(self.graph.nodes),
             bucket_mode=effective_bucket_mode,
             fsdp_param_module_order=fsdp_param_module_order,
@@ -560,6 +594,9 @@ def joint_transformer_block_bucketing_reordering_pass(
     insert_overlap_deps: bool = False,
     bucket_mode: BucketMode | None = None,
     fsdp_param_module_order: dict[str, int] | None = None,
+    bucket_all_gathers: bool = True,
+    bucket_reduce_scatters: bool = True,
+    bucket_all_reduces: bool = True,
 ) -> torch.fx.GraphModule:
     """Run joint-graph manual bucketing and reordering.
 
@@ -583,6 +620,9 @@ def joint_transformer_block_bucketing_reordering_pass(
             defaults to ``"custom_ops"`` via the parent class.
         fsdp_param_module_order: module order derived from traced parameter
             FQNs, used to pack FSDP buckets like Eager FSDP2.
+        bucket_all_gathers: whether to bucket all-gather collectives.
+        bucket_reduce_scatters: whether to bucket reduce-scatter collectives.
+        bucket_all_reduces: whether to bucket all-reduce collectives.
     """
 
     def _stack_fn(node: torch.fx.Node) -> list[tuple[str, type]]:
@@ -590,6 +630,15 @@ def joint_transformer_block_bucketing_reordering_pass(
         if not fqn:
             return []
         return [(fqn, torch.nn.Module)]
+
+    def _should_bucket_collective(node: fx.Node) -> bool:
+        if is_all_gather(node):
+            return bucket_all_gathers
+        if is_reduce_scatter_tensor(node):
+            return bucket_reduce_scatters
+        if is_all_reduce_tensor(node):
+            return bucket_all_reduces
+        return False
 
     scheduler = JointManualOverlapScheduler(
         gm,
@@ -599,10 +648,84 @@ def joint_transformer_block_bucketing_reordering_pass(
         module_stack_fn=_stack_fn,
         bucket_mode=bucket_mode,
         fsdp_param_module_order=fsdp_param_module_order,
+        should_bucket_collective=_should_bucket_collective,
     )
     overlapped_gm = scheduler.run()
     overlapped_gm.recompile()
     return overlapped_gm
+
+
+def merge_all_all_gathers(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Merge each compatible group of all-gathers into one collective."""
+    all_gathers = [node for node in gm.graph.nodes if is_all_gather(node)]
+    all_gather_nodes_by_group_key: dict[tuple[Any, ...], list[fx.Node]] = defaultdict(
+        list
+    )
+    for node in all_gathers:
+        all_gather_nodes_by_group_key[(node.args[1], node.args[2])].append(node)
+    for group_nodes in all_gather_nodes_by_group_key.values():
+        if len(group_nodes) > 1:
+            merge_all_gather_bucket(
+                gm.graph,
+                group_nodes,
+                mode="custom_ops",
+            )
+    _stable_topological_sort(gm.graph, {})
+    gm.recompile()
+    return gm
+
+
+def merge_all_reduce_scatters(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Merge each compatible group of reduce-scatters into one collective."""
+    reduce_scatters = [
+        node for node in gm.graph.nodes if is_reduce_scatter_tensor(node)
+    ]
+    reduce_scatter_nodes_by_group_key: dict[
+        tuple[Any, ...], list[fx.Node]
+    ] = defaultdict(list)
+    for node in reduce_scatters:
+        value = node.meta["val"]
+        reduce_scatter_nodes_by_group_key[
+            (node.args[1], node.args[2], node.args[3], value.device, value.dtype)
+        ].append(node)
+    for group_nodes in reduce_scatter_nodes_by_group_key.values():
+        if len(group_nodes) > 1:
+            merge_reduce_scatter_bucket(
+                gm.graph,
+                group_nodes,
+                mode="custom_ops",
+            )
+    _stable_topological_sort(gm.graph, {})
+    gm.recompile()
+    return gm
+
+
+def merge_all_all_reduces(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+) -> torch.fx.GraphModule:
+    """Merge each compatible group of all-reduces into one collective."""
+    all_reduces = [node for node in gm.graph.nodes if is_all_reduce_tensor(node)]
+    all_reduce_nodes_by_group_key: dict[tuple[Any, ...], list[fx.Node]] = defaultdict(
+        list
+    )
+    for node in all_reduces:
+        value = node.meta["val"]
+        all_reduce_nodes_by_group_key[
+            (node.args[1], node.args[2], value.device, value.dtype)
+        ].append(node)
+    for group_nodes in all_reduce_nodes_by_group_key.values():
+        if len(group_nodes) > 1:
+            merge_all_reduce_bucket(gm.graph, group_nodes)
+    _stable_topological_sort(gm.graph, {})
+    gm.recompile()
+    return gm
 
 
 # --- EP-aware FSDP dense-region scheduling ---
@@ -1158,9 +1281,14 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         if node.target is not torch.ops.aten.add_.Tensor:
             return False, f"{wait.name} has non-output user {node.name} ({node.target})"
 
-        mutated_arg = node.args[0] if node.args else None
-        if not isinstance(mutated_arg, fx.Node):
-            return False, f"{node.name} has non-node mutated input"
+        mutation_targets = mutation_target_nodes(node)
+        if len(mutation_targets) != 1:
+            return (
+                False,
+                f"{node.name} has {len(mutation_targets)} schema-declared "
+                "mutation targets; expected one",
+            )
+        (mutated_arg,) = mutation_targets
 
         # Chunked loss can accumulate multiple reduce-scattered grad shards via
         # an in-place add chain before returning the detached final shard. That

@@ -22,18 +22,20 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.common_fsdp import FSDPTest
+from torchtitan_recipes.tests.graph_trainer import numerics as graph_trainer_numerics
 
 from torchtitan.components.loss import cross_entropy_loss
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelismContext
 from torchtitan.experiments.graph_trainer import simple_fsdp
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
-from torchtitan.models.common.config_utils import DEFAULT_DEBUG_MODEL_SEQ_LEN
+from torchtitan.models.common.linear import GroupedLinear, Linear
 
 
 STEPS = 20
+NUMERICS_CONFIG_MODULE = graph_trainer_numerics.__name__
 
 
 def run_loss_compare(
@@ -41,10 +43,10 @@ def run_loss_compare(
     baseline_config: str,
     test_module: str,
     test_config: str,
-    baseline_options: str = "",
-    test_options: str = "",
     baseline_ngpus: int = 8,
     test_ngpus: int = 8,
+    metrics: tuple[str, ...] = ("loss",),
+    steps: int = STEPS,
 ) -> bool:
     """Run loss_compare.py comparing a baseline module against a graph_trainer module.
 
@@ -53,10 +55,10 @@ def run_loss_compare(
         baseline_config: Config name for baseline (e.g., "llama3_debugmodel").
         test_module: Module name for test (e.g., "graph_trainer.llama3").
         test_config: Config name for test (e.g., "graph_trainer_llama3_debugmodel").
-        baseline_options: Additional CLI options for the baseline run.
-        test_options: Additional CLI options for the test run.
         baseline_ngpus: Number of GPUs for the baseline run.
         test_ngpus: Number of GPUs for the test run.
+        metrics: Full-precision TensorBoard metrics that must match exactly.
+        steps: Number of optimizer steps in both runs.
 
     Returns:
         True if the assertion passed, False otherwise.
@@ -74,16 +76,12 @@ def run_loss_compare(
             f"--test-module={test_module}",
             f"--test-config={test_config}",
             "--assert-equal",
-            f"--steps={STEPS}",
+            f"--steps={steps}",
             f"--baseline-ngpus={baseline_ngpus}",
             f"--test-ngpus={test_ngpus}",
+            f"--metrics={','.join(metrics)}",
             f"--job-dump-folder={job_dump_folder}",
         ]
-        if baseline_options:
-            cmd.append(f"--baseline-options={baseline_options}")
-        if test_options:
-            cmd.append(f"--test-options={test_options}")
-
         print(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, text=True)
         if result.returncode != 0:
@@ -96,19 +94,19 @@ def run_loss_compare_close(
     baseline_config: str,
     test_module: str,
     test_config: str,
-    baseline_options: str = "",
-    test_options: str = "",
     baseline_ngpus: int = 8,
     test_ngpus: int = 8,
+    metrics: tuple[str, ...] = ("loss",),
+    steps: int = STEPS,
     rtol: float = 1e-4,
     atol: float = 1e-5,
 ) -> bool:
-    """Run loss_compare.py and assert losses are numerically close.
+    """Run loss_compare.py and assert selected metrics are numerically close.
 
-    AutoParallel can choose a different SPMD graph and collective ordering than
-    eager, so this checks tight numerical agreement rather than bitwise identity.
+    Backends may intentionally change graph, collective, or gradient-accumulation
+    rounding, so this checks tight numerical agreement rather than bitwise identity.
     """
-    from scripts.loss_compare import extract_losses_from_tensorboard
+    from scripts.loss_compare import extract_metrics_from_tensorboard
 
     with tempfile.TemporaryDirectory() as job_dump_folder:
         cmd = [
@@ -120,47 +118,54 @@ def run_loss_compare_close(
             f"--baseline-config={baseline_config}",
             f"--test-module={test_module}",
             f"--test-config={test_config}",
-            f"--steps={STEPS}",
+            f"--steps={steps}",
             f"--baseline-ngpus={baseline_ngpus}",
             f"--test-ngpus={test_ngpus}",
+            f"--metrics={','.join(metrics)}",
             f"--job-dump-folder={job_dump_folder}",
         ]
-        if baseline_options:
-            cmd.append(f"--baseline-options={baseline_options}")
-        if test_options:
-            cmd.append(f"--test-options={test_options}")
-
         print(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, text=True)
         if result.returncode != 0:
             print("loss_compare.py failed")
             return False
 
-        baseline_losses = extract_losses_from_tensorboard(
-            job_dump_folder, "tb_baseline"
+        baseline_metrics = extract_metrics_from_tensorboard(
+            job_dump_folder,
+            "tb_baseline",
+            metrics,
         )
-        test_losses = extract_losses_from_tensorboard(job_dump_folder, "tb_test")
-        if baseline_losses.keys() != test_losses.keys():
-            return False
-        max_step = max(
-            baseline_losses,
-            key=lambda step: abs(baseline_losses[step] - test_losses[step]),
+        test_metrics = extract_metrics_from_tensorboard(
+            job_dump_folder,
+            "tb_test",
+            metrics,
         )
-        max_diff = abs(baseline_losses[max_step] - test_losses[max_step])
-        print(
-            "Max loss difference: "
-            f"step={max_step} baseline={baseline_losses[max_step]!r} "
-            f"test={test_losses[max_step]!r} diff={max_diff!r}"
-        )
-        return all(
-            math.isclose(
-                baseline_losses[step],
-                test_losses[step],
-                rel_tol=rtol,
-                abs_tol=atol,
+        for metric in metrics:
+            baseline_values = baseline_metrics[metric]
+            test_values = test_metrics[metric]
+            if baseline_values.keys() != test_values.keys():
+                return False
+            max_step = max(
+                baseline_values,
+                key=lambda step: abs(baseline_values[step] - test_values[step]),
             )
-            for step in baseline_losses
-        )
+            max_diff = abs(baseline_values[max_step] - test_values[max_step])
+            print(
+                f"Max {metric} difference: "
+                f"step={max_step} baseline={baseline_values[max_step]!r} "
+                f"test={test_values[max_step]!r} diff={max_diff!r}"
+            )
+            if not all(
+                math.isclose(
+                    baseline_values[step],
+                    test_values[step],
+                    rel_tol=rtol,
+                    abs_tol=atol,
+                )
+                for step in baseline_values
+            ):
+                return False
+        return True
 
 
 @contextmanager
@@ -232,178 +237,43 @@ def _extract_losses_from_rank_tensorboard(
     return losses
 
 
-LLAMA3_PARALLELISM = (
-    "--parallelism.tensor_parallel_degree=2"
-    " --parallelism.data_parallel_shard_degree=4"
-)
-DEBUGMODEL_TRAINING_OPTIONS = (
-    f"--training.max_context_length={DEFAULT_DEBUG_MODEL_SEQ_LEN}"
-    " --training.num_tokens_per_microbatch_per_dp_rank=16384"
-)
-
-
-def _run_llama3_loss_compare(test_options_extra: str = "") -> bool:
+def _run_llama3_loss_compare() -> bool:
     """Run loss_compare for llama3 vs graph_trainer.llama3 with FSDP+TP."""
-    options = f"{LLAMA3_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
-    test_options = options
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
     return run_loss_compare(
-        baseline_module="llama3",
-        baseline_config="llama3_debugmodel",
-        test_module="graph_trainer.llama3",
-        test_config="graph_trainer_llama3_debugmodel",
-        baseline_options=options,
-        test_options=test_options,
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="llama3_eager_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="llama3_graph_numerics",
     )
-
-
-DSV3_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=4"
-    " --parallelism.tensor_parallel_degree=2"
-    " --parallelism.expert_parallel_degree=2"
-)
-DSV3_EP_OVERLAP_GRAPH_PARALLELISM = (
-    "--training.disable_cuda_graphs"
-    " --parallelism.data_parallel_shard_degree=8"
-    " --parallelism.tensor_parallel_degree=1"
-    " --parallelism.expert_parallel_degree=2"
-)
-DSV3_EP_OVERLAP_OPTIONS = (
-    "--compile.mode aot_fx_trace"
-    " --compile.ep_overlap.enabled"
-    " --compile.ep_overlap.chunk_dim batch"
-    " --compile.ep_overlap.module_fqn layers.*"
-)
-DSV3_EP_OVERLAP_MOE_SEQ_OPTIONS = (
-    "--compile.mode aot_fx_trace"
-    " --compile.ep_overlap.enabled"
-    " --compile.ep_overlap.chunk_dim seq"
-    " --compile.ep_overlap.module_fqn layers.*.moe"
-)
-DSV3_EP_OVERLAP_MOE_BATCH_OPTIONS = (
-    "--compile.mode aot_fx_trace"
-    " --compile.ep_overlap.enabled"
-    " --compile.ep_overlap.chunk_dim batch"
-    " --compile.ep_overlap.module_fqn layers.*.moe"
-)
-DSV3_EP_OVERLAP_EAGER = " --compile.ep_overlap.strategy eager"
-DSV3_EP_OVERLAP_GRAPH = " --compile.ep_overlap.strategy graph"
-DSV3_EP_OVERLAP_GRAPH_BITWISE = (
-    DSV3_EP_OVERLAP_GRAPH + " --compile.ep_overlap.disable_early_grad_accumulation"
-)
 
 
 def _run_deepseek_v3_loss_compare(
-    test_options_extra: str = "",
     *,
-    baseline_module: str = "deepseek_v3",
-    baseline_config: str = "deepseek_v3_debugmodel",
-    test_config: str = "graph_trainer_deepseek_v3_debugmodel",
-    parallelism: str = DSV3_PARALLELISM,
-    baseline_options_extra: str = "",
+    baseline_config: str = "deepseek_v3_eager_numerics",
+    test_config: str = "deepseek_v3_graph_numerics",
 ) -> bool:
     """Run loss_compare for deepseek_v3 vs graph_trainer.deepseek_v3."""
-    options = f"{parallelism} {DEBUGMODEL_TRAINING_OPTIONS}"
-    baseline_options = options
-    if baseline_options_extra:
-        baseline_options += f" {baseline_options_extra}"
-    test_options = options
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
     return run_loss_compare(
-        baseline_module=baseline_module,
+        baseline_module=NUMERICS_CONFIG_MODULE,
         baseline_config=baseline_config,
-        test_module="graph_trainer.deepseek_v3",
+        test_module=NUMERICS_CONFIG_MODULE,
         test_config=test_config,
-        baseline_options=baseline_options,
-        test_options=test_options,
     )
-
-
-def _run_deepseek_v3_ep_overlap_loss_compare() -> bool:
-    """Run distributed DeepSeek-v3 EP overlap against eager chunking."""
-    return _run_deepseek_v3_loss_compare(
-        baseline_module="graph_trainer.deepseek_v3",
-        baseline_config="graph_trainer_deepseek_v3_debugmodel",
-        test_config="graph_trainer_deepseek_v3_debugmodel",
-        parallelism=DSV3_EP_OVERLAP_GRAPH_PARALLELISM,
-        baseline_options_extra=DSV3_EP_OVERLAP_OPTIONS + DSV3_EP_OVERLAP_EAGER,
-        test_options_extra=DSV3_EP_OVERLAP_OPTIONS + DSV3_EP_OVERLAP_GRAPH_BITWISE,
-    )
-
-
-def _run_deepseek_v3_ep_overlap_moe_seq_loss_compare() -> bool:
-    """Run distributed DeepSeek-v3 MoE seq overlap against eager chunking."""
-    return _run_deepseek_v3_loss_compare(
-        baseline_module="graph_trainer.deepseek_v3",
-        baseline_config="graph_trainer_deepseek_v3_debugmodel",
-        test_config="graph_trainer_deepseek_v3_debugmodel",
-        parallelism=DSV3_EP_OVERLAP_GRAPH_PARALLELISM,
-        baseline_options_extra=DSV3_EP_OVERLAP_MOE_SEQ_OPTIONS + DSV3_EP_OVERLAP_EAGER,
-        test_options_extra=DSV3_EP_OVERLAP_MOE_SEQ_OPTIONS
-        + DSV3_EP_OVERLAP_GRAPH_BITWISE,
-    )
-
-
-def _run_deepseek_v3_ep_overlap_moe_batch_loss_compare() -> bool:
-    """Run distributed DeepSeek-v3 MoE batch overlap against eager chunking."""
-    return _run_deepseek_v3_loss_compare(
-        baseline_module="graph_trainer.deepseek_v3",
-        baseline_config="graph_trainer_deepseek_v3_debugmodel",
-        test_config="graph_trainer_deepseek_v3_debugmodel",
-        parallelism=DSV3_EP_OVERLAP_GRAPH_PARALLELISM,
-        baseline_options_extra=DSV3_EP_OVERLAP_MOE_BATCH_OPTIONS
-        + DSV3_EP_OVERLAP_EAGER,
-        test_options_extra=DSV3_EP_OVERLAP_MOE_BATCH_OPTIONS
-        + DSV3_EP_OVERLAP_GRAPH_BITWISE,
-    )
-
-
-GRAPH_PP_DSV3_PP_OPTIONS = (
-    "--training.disable_cuda_graphs"
-    " --parallelism.pipeline_parallel_degree=2"
-    " --parallelism.num_pp_microbatches=8"
-    " --parallelism.data_parallel_shard_degree=4"
-    " --parallelism.expert_parallel_degree=2"
-    " --training.num_tokens_per_microbatch_per_dp_rank=2048"
-    # Eager PP cannot be the baseline for ZBVZeroBubble or DualPipeV here:
-    # FlexInnerAttention needs torch.compile, and torch.compile is incompatible with
-    # those eager PP schedules. Compare GraphPP schedules against eager
-    # Interleaved1F1B instead. TorchTitan gradient clipping is applied per
-    # local rank, so different PP schedules can produce different clip
-    # coefficients even when pre-clip grads are bitwise equal. Disable clipping
-    # to isolate GraphPP graph execution from that schedule-level effect.
-    " --training.max_norm=inf"
-)
-
-
-GRAPH_PP_DSV3_TEST_PARALLELISM = (
-    "--compile.mode aot_fx_trace"
-    " --compile.inductor_compilation regional"
-    f" {GRAPH_PP_DSV3_PP_OPTIONS}"
-)
 
 
 def _run_graph_pp_deepseek_v3_loss_compare(schedule: str) -> bool:
     """Run exact loss_compare for eager Interleaved1F1B PP vs GraphPP."""
     from scripts.loss_compare import create_seed_checkpoint, run_training
 
-    baseline_options = (
-        f"{GRAPH_PP_DSV3_PP_OPTIONS}"
-        " --parallelism.pipeline_parallel_schedule=Interleaved1F1B"
-        " --metrics.save_for_all_ranks"
-    )
-    test_options = (
-        f"{GRAPH_PP_DSV3_TEST_PARALLELISM}"
-        f" --parallelism.pipeline_parallel_schedule={schedule}"
-        " --metrics.save_for_all_ranks"
-    )
-
-    baseline_module = "graph_trainer.deepseek_v3"
-    baseline_config = "graph_trainer_deepseek_v3_debugmodel_eager_pp"
-    test_module = "graph_trainer.deepseek_v3"
-    test_config = "graph_trainer_deepseek_v3_debugmodel"
+    test_configs = {
+        "Interleaved1F1B": "deepseek_v3_graph_pp_interleaved_numerics",
+        "ZBVZeroBubble": "deepseek_v3_graph_pp_zbv_numerics",
+        "DualPipeV": "deepseek_v3_graph_pp_dual_pipe_v_numerics",
+    }
+    baseline_module = NUMERICS_CONFIG_MODULE
+    baseline_config = "deepseek_v3_eager_pp_numerics"
+    test_module = NUMERICS_CONFIG_MODULE
+    test_config = test_configs[schedule]
     baseline_tb_folder = "tb_baseline"
     test_tb_folder = "tb_test"
     baseline_loss_rank = 4
@@ -427,7 +297,6 @@ def _run_graph_pp_deepseek_v3_loss_compare(schedule: str) -> bool:
                 "baseline",
                 baseline_module,
                 baseline_config,
-                baseline_options,
                 STEPS,
                 True,
                 None,
@@ -446,7 +315,6 @@ def _run_graph_pp_deepseek_v3_loss_compare(schedule: str) -> bool:
                 "test",
                 test_module,
                 test_config,
-                test_options,
                 STEPS,
                 True,
                 None,
@@ -463,102 +331,52 @@ def _run_graph_pp_deepseek_v3_loss_compare(schedule: str) -> bool:
     return _losses_are_equal(baseline_losses, test_losses)
 
 
-QWEN3_PARALLELISM = (
-    "--parallelism.tensor_parallel_degree=2"
-    " --parallelism.data_parallel_shard_degree=4"
-)
-
-
-def _run_qwen3_loss_compare(test_options_extra: str = "") -> bool:
+def _run_qwen3_loss_compare() -> bool:
     """Run loss_compare for qwen3 vs graph_trainer.qwen3 with FSDP+TP."""
-    options = f"{QWEN3_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
-    test_options = options
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
     return run_loss_compare(
-        baseline_module="qwen3",
-        baseline_config="qwen3_debugmodel",
-        test_module="graph_trainer.qwen3",
-        test_config="graph_trainer_qwen3_debugmodel",
-        baseline_options=options,
-        test_options=test_options,
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="qwen3_eager_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="qwen3_graph_numerics",
     )
 
 
-QWEN3_MOE_PARALLELISM = (
-    "--training.disable_cuda_graphs"
-    " --parallelism.data_parallel_shard_degree=4"
-    " --parallelism.tensor_parallel_degree=2"
-    " --parallelism.expert_parallel_degree=2"
-)
-
-
-def _run_qwen3_moe_loss_compare(test_options_extra: str = "") -> bool:
+def _run_qwen3_moe_loss_compare() -> bool:
     """Run loss_compare for qwen3 MoE vs graph_trainer.qwen3 MoE."""
-    options = f"{QWEN3_MOE_PARALLELISM} {DEBUGMODEL_TRAINING_OPTIONS}"
-    test_options = options
-    if test_options_extra:
-        test_options += f" {test_options_extra}"
-    return run_loss_compare(
-        baseline_module="qwen3",
-        baseline_config="qwen3_moe_debug",
-        test_module="graph_trainer.qwen3",
-        test_config="graph_trainer_qwen3_debugmodel_moe",
-        baseline_options=options,
-        test_options=test_options,
+    # Close, not bitwise: eager FSDP2 keeps the router's fp32 grad_weight, while SimpleFSDP's
+    # unsharded weight is a bf16 non-leaf, so autograd rounds it:
+    # https://github.com/pytorch/pytorch/issues/189633
+    return run_loss_compare_close(
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="qwen3_moe_eager_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="qwen3_moe_graph_numerics",
     )
-
-
-AUTOPARALLEL_LLAMA3_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=2"
-    " --parallelism.tensor_parallel_degree=2"
-)
 
 
 def _run_autoparallel_llama3_loss_compare() -> bool:
-    """Run loss_compare for eager SDPA llama3 vs graph_trainer AutoParallel.
+    """Run loss_compare for manual SDPA llama3 vs AutoParallel.
 
     AutoParallel is unsupported on the default FlexInnerAttention backend (dynamo
     export flattens the BlockMask), so both sides use the test-only SDPA backend.
-    The eager baseline runs the same SDPA model through GraphTrainer with
-    ``mode=None`` (delegates to the core eager path).
     """
     return run_loss_compare_close(
-        baseline_module="graph_trainer.llama3",
-        baseline_config="graph_trainer_llama3_debugmodel_sdpa_eager",
-        test_module="graph_trainer.llama3",
-        test_config="graph_trainer_llama3_debugmodel_sdpa_cross_entropy_loss",
-        baseline_options=AUTOPARALLEL_LLAMA3_PARALLELISM,
-        test_options=(
-            f"{AUTOPARALLEL_LLAMA3_PARALLELISM}"
-            " --compile.mode aot_fx_trace"
-            " --compile.enable_autoparallel"
-        ),
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="llama3_sdpa_manual_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="llama3_sdpa_autoparallel_numerics",
         baseline_ngpus=4,
         test_ngpus=4,
     )
 
 
-AUTOPARALLEL_DSV3_PARALLELISM = (
-    "--parallelism.data_parallel_shard_degree=4"
-    " --parallelism.expert_parallel_degree=2"
-    f" {DEBUGMODEL_TRAINING_OPTIONS}"
-)
-
-
 def _run_autoparallel_deepseek_v3_loss_compare() -> bool:
     """Run loss_compare for eager DeepSeek V3 vs graph_trainer AutoParallel."""
     return run_loss_compare_close(
-        baseline_module="deepseek_v3",
-        baseline_config="deepseek_v3_debugmodel",
-        test_module="graph_trainer.deepseek_v3",
-        test_config="graph_trainer_deepseek_v3_debugmodel",
-        baseline_options=AUTOPARALLEL_DSV3_PARALLELISM,
-        test_options=(
-            f"{AUTOPARALLEL_DSV3_PARALLELISM}"
-            " --compile.mode aot_fx_trace"
-            " --compile.enable_autoparallel"
-        ),
+        baseline_module=NUMERICS_CONFIG_MODULE,
+        baseline_config="deepseek_v3_manual_numerics",
+        test_module=NUMERICS_CONFIG_MODULE,
+        test_config="deepseek_v3_autoparallel_numerics",
         baseline_ngpus=4,
         test_ngpus=4,
         rtol=5e-4,
@@ -569,46 +387,7 @@ class TestGraphTrainerNumerics(unittest.TestCase):
     """Test numerics equivalence between graph_trainer and FSDP2 eager."""
 
     def test_dense_llama3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(test_options_extra="--compile.mode aot_fx_trace"),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_dense_llama3_jit_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(test_options_extra="--compile.mode jit"),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_dense_llama3_auto_bucketing_jit_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(
-                test_options_extra="--compile.mode jit --compile.passes auto_bucketing"
-            ),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_dense_llama3_manual_bucketing_jit_vs_eager(self):
-        self.assertTrue(
-            _run_llama3_loss_compare(
-                test_options_extra="--compile.mode jit --compile.passes transformer_block_bucketing"
-            ),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_moe_dsv3_jit_vs_eager(self):
-        """Test graph_trainer.deepseek_v3 matches deepseek_v3 (JIT)."""
-        self.assertTrue(
-            _run_deepseek_v3_loss_compare(test_options_extra="--compile.mode jit"),
-        )
-
-    @unittest.skip("Disabled: upstream partitioner regression (#2149)")
-    def test_moe_dsv3_manual_bucketing_jit_vs_eager(self):
-        self.assertTrue(
-            _run_deepseek_v3_loss_compare(
-                test_options_extra="--compile.mode jit --compile.passes transformer_block_bucketing"
-            ),
-        )
+        self.assertTrue(_run_llama3_loss_compare())
 
     @unittest.skip(
         "Disabled: flaky single-rank crash in DSv3 MoE EP all-to-all. Losses "
@@ -618,32 +397,14 @@ class TestGraphTrainerNumerics(unittest.TestCase):
         "diagnosed and fixed."
     )
     def test_moe_dsv3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(
-            _run_deepseek_v3_loss_compare(
-                test_options_extra="--compile.mode aot_fx_trace"
-            ),
-        )
-
-    # TODO(#4342): Remove transformer-level chunking. After the model batch
-    # dimension was folded into the token dimension, splitting `layers.*` in
-    # half cuts the packed token stream mid-document, so neither chunk has full
-    # attention context and the loss goes non-finite at step 1.
-    @unittest.expectedFailure
-    def test_moe_dsv3_ep_overlap_aot_fx_trace_vs_eager_chunked(self):
-        self.assertTrue(_run_deepseek_v3_ep_overlap_loss_compare())
-
-    def test_moe_dsv3_ep_overlap_moe_seq_aot_fx_trace_vs_eager_chunked(self):
-        self.assertTrue(_run_deepseek_v3_ep_overlap_moe_seq_loss_compare())
-
-    def test_moe_dsv3_ep_overlap_moe_batch_aot_fx_trace_vs_eager_chunked(self):
-        self.assertTrue(_run_deepseek_v3_ep_overlap_moe_batch_loss_compare())
+        self.assertTrue(_run_deepseek_v3_loss_compare())
 
     @unittest.skip(
         # Flaky on H100 CI: the DSv3 MoE EP all-to-all is not bitwise
-        # deterministic under --debug.deterministic (ALLTOALL_BASE reduction
+        # deterministic with debug.deterministic (ALLTOALL_BASE reduction
         # order varies across NCCL/driver), so the aot_fx_trace vs eager loss
         # compare diverges by ~2e-5. Passes bitwise locally. See #3874.
-        "flaky: DSv3 MoE EP all-to-all nondeterminism under --debug.deterministic (#3874)"
+        "flaky: DSv3 MoE EP all-to-all nondeterminism with debug.deterministic (#3874)"
     )
     def test_graph_pp_moe_dsv3_aot_fx_trace_vs_eager(self):
         for schedule in ("Interleaved1F1B", "ZBVZeroBubble", "DualPipeV"):
@@ -651,15 +412,67 @@ class TestGraphTrainerNumerics(unittest.TestCase):
                 self.assertTrue(_run_graph_pp_deepseek_v3_loss_compare(schedule))
 
     def test_dense_qwen3_aot_fx_trace_vs_eager(self):
-        self.assertTrue(
-            _run_qwen3_loss_compare(test_options_extra="--compile.mode aot_fx_trace"),
-        )
+        self.assertTrue(_run_qwen3_loss_compare())
 
     def test_moe_qwen3_aot_fx_trace_vs_eager(self):
+        self.assertTrue(_run_qwen3_moe_loss_compare())
+
+
+def _run_dist_moe_pp_loss_compare(
+    baseline_config: str,
+    test_config: str,
+) -> bool:
+    """Compare exact Dist-MoE PP loss and gradient norm on four GPUs."""
+    with _log_rank(2):
+        return run_loss_compare(
+            NUMERICS_CONFIG_MODULE,
+            baseline_config,
+            NUMERICS_CONFIG_MODULE,
+            test_config,
+            baseline_ngpus=4,
+            test_ngpus=4,
+            metrics=("loss", "grad_norm"),
+            steps=4,
+        )
+
+
+def _run_dist_moe_graph_pp_loss_compare_close() -> bool:
+    """Compare GraphPP against eager across the known WGrad rounding boundary."""
+    with _log_rank(2):
+        return run_loss_compare_close(
+            NUMERICS_CONFIG_MODULE,
+            "deepseek_v3_dist_moe_eager_pp_stage_microbatch_numerics",
+            NUMERICS_CONFIG_MODULE,
+            "deepseek_v3_dist_moe_graph_pp_stage_microbatch_numerics",
+            baseline_ngpus=4,
+            test_ngpus=4,
+            metrics=("loss", "grad_norm"),
+            steps=4,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+
+@unittest.skipUnless(
+    torch.cuda.device_count() >= 4 and importlib.util.find_spec("dist_moe") is not None,
+    "requires four CUDA devices and the optional dist-moe package",
+)
+class TestDistMoePipelineNumerics(unittest.TestCase):
+    """Verify Dist-MoE slot selection and cross-engine numerical agreement."""
+
+    def test_graph_pp_matches_eager(self) -> None:
+        """GraphPP and eager agree across their WGrad rounding boundary."""
+        # FIXME(https://github.com/pytorch/torchtitan/issues/5043): restore
+        # bitwise parity after GraphPP preserves singleton-FSDP reduce dtype.
+        self.assertTrue(_run_dist_moe_graph_pp_loss_compare_close())
+
+    def test_eager_slot_policies_match_bitwise(self) -> None:
+        """Changing only eager slot granularity must preserve exact numerics."""
         self.assertTrue(
-            _run_qwen3_moe_loss_compare(
-                test_options_extra="--compile.mode aot_fx_trace"
-            ),
+            _run_dist_moe_pp_loss_compare(
+                "deepseek_v3_dist_moe_eager_pp_microbatch_numerics",
+                "deepseek_v3_dist_moe_eager_pp_stage_microbatch_numerics",
+            )
         )
 
 
@@ -671,7 +484,7 @@ class TestGraphTrainerAutoParallelNumerics(unittest.TestCase):
     """Test graph_trainer AutoParallel numerics equivalence against eager."""
 
     # AutoParallel runs on the test-only SDPA backend (Decoder.forward lists
-    # positions before attention_masks so input_fn's (tokens, positions) binds
+    # positions before attention_metadata so input_fn's (tokens, positions) binds
     # correctly). It is unsupported on the default FlexInnerAttention backend (dynamo
     # export flattens the BlockMask to (Fake)Tensors and flex_attention fails on
     # missing BLOCK_SIZE), so both eager baseline and AutoParallel test use SDPA.
@@ -989,6 +802,53 @@ class TestSimpleFSDP(FSDPTest):
     def test_empty_fsdp_shard_with_tp(self):
         self._test_sharding(num_outputs=2)
 
+    def test_stacked_linear_shards_matrix_rows(self):
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
+        )
+        model = Linear.Config(
+            in_features=8,
+            out_features=8,
+            num_linears=2,
+            bias=True,
+        ).build()
+        model.to(device)
+
+        data_parallel(model, mesh, "fully_shard")
+
+        weight = model._parameters["weight"]
+        bias = model._parameters["bias"]
+        self.assertIsInstance(weight, DTensor)
+        self.assertIsInstance(bias, DTensor)
+        self.assertEqual(weight.placements, (Shard(1),))
+        self.assertEqual(bias.placements, (Shard(1),))
+
+    def test_stacked_grouped_linear_shards_matrix_rows(self):
+        device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
+        device = (
+            torch.device(device_type, self.rank) if device_type == "cuda" else "cpu"
+        )
+        mesh = init_device_mesh(
+            device_type, (self.world_size,), mesh_dim_names=("fsdp",)
+        )
+        model = GroupedLinear.Config(
+            group_size=4,
+            in_features=8,
+            out_features=8,
+            num_linears=2,
+        ).build()
+        model.to(device)
+
+        data_parallel(model, mesh, "fully_shard")
+
+        weight = model._parameters["weight"]
+        self.assertIsInstance(weight, DTensor)
+        self.assertEqual(weight.placements, (Shard(2),))
+
     def test_frozen_parameter_remains_frozen(self):
         device_type = "cuda" if dist.get_backend() == "nccl" else "cpu"
         device = (
@@ -1030,7 +890,7 @@ class TestSimpleFSDP(FSDPTest):
         else:
             raise ValueError(f"Unsupported mode {self.mode}")
 
-        self.parallel_dims = ParallelDims(
+        self.parallelism_context = ParallelismContext(
             dp_shard=data_parallel_shard_degree,
             dp_replicate=data_parallel_replicate_degree,
             cp=1,
@@ -1038,6 +898,7 @@ class TestSimpleFSDP(FSDPTest):
             pp=1,
             ep=1,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
 
     def get_input(self):
@@ -1047,7 +908,9 @@ class TestSimpleFSDP(FSDPTest):
         return model, inputs, labels
 
     def run_fsdp2(self, model, inputs, labels, epoch=20):
-        fully_shard(model, mesh=self.parallel_dims.get_mesh(self.dp_mesh_dim_names))
+        fully_shard(
+            model, mesh=self.parallelism_context.get_mesh(self.dp_mesh_dim_names)
+        )
         optim = self.optimizer(model.parameters(), lr=1e-4)
         losses = []
         for _ in range(epoch):
@@ -1062,7 +925,7 @@ class TestSimpleFSDP(FSDPTest):
     def run_simple_fsdp(self, model, inputs, labels, epoch=20):
         model = data_parallel(
             model,
-            device_mesh=self.parallel_dims.get_mesh(self.dp_mesh_dim_names),
+            device_mesh=self.parallelism_context.get_mesh(self.dp_mesh_dim_names),
             mode=self.mode,
         )
         optim = self.optimizer(model.parameters(), lr=1e-4)
@@ -1079,7 +942,7 @@ class TestSimpleFSDP(FSDPTest):
     def run_simple_fsdp_compiled_aot_eager(self, model, inputs, labels, epoch=20):
         model = data_parallel(
             model,
-            device_mesh=self.parallel_dims.get_mesh(self.dp_mesh_dim_names),
+            device_mesh=self.parallelism_context.get_mesh(self.dp_mesh_dim_names),
             mode=self.mode,
         )
         # TODO: Add "inductor" backend when it's numerical issues are fixed

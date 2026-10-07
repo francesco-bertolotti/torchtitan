@@ -15,14 +15,18 @@ from datetime import datetime
 from typing import Any
 
 import torch
+from torch.distributed.pipelining.schedules import (
+    get_schedule_class,
+    ScheduleDualPipeV,
+    ScheduleZBVZeroBubble,
+)
 from torch.utils.tensorboard import SummaryWriter
 
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optim import OptimizersContainer
 from torchtitan.config import Configurable
-from torchtitan.distributed import ParallelDims
+from torchtitan.distributed import ParallelismContext
 from torchtitan.tools import utils
 from torchtitan.tools.utils import Color, device_module, device_type, NoColor
-
 
 # named tuple for passing device memory stats for logging
 logger = logging.getLogger(__name__)
@@ -175,13 +179,18 @@ class WandBLogger(BaseLogger):
         # Create logging directory
         os.makedirs(log_dir, exist_ok=True)
 
+        # WANDB_RUN_TAGS is comma-separated; wandb expects a sequence of tags.
+        tags = None
+        if tags_env := os.getenv("WANDB_RUN_TAGS"):
+            tags = [t.strip() for t in tags_env.split(",") if t.strip()] or None
+
         self.wandb.init(
             entity=os.getenv("WANDB_TEAM", None),
             project=os.getenv("WANDB_PROJECT", "torchtitan"),
             name=os.getenv("WANDB_RUN_NAME", None),
             id=os.getenv("WANDB_RUN_ID", None),
             notes=os.getenv("WANDB_RUN_NOTES", None),
-            tags=os.getenv("WANDB_RUN_TAGS", None),
+            tags=tags,
             group=os.getenv("WANDB_RUN_GROUP", None),
             job_type=os.getenv("WANDB_RUN_JOB_TYPE", None),
             resume_from=os.getenv("WANDB_RESUME_FROM", None),
@@ -196,7 +205,7 @@ class WandBLogger(BaseLogger):
             (k if self.tag is None else f"{self.tag}/{k}"): v
             for k, v in metrics.items()
         }
-        self.wandb.log(wandb_metrics, step=step)
+        self.wandb.log(wandb_metrics, step=step, commit=True)
 
     def close(self) -> None:
         if self.wandb.run is not None:
@@ -225,8 +234,14 @@ class LoggerContainer(BaseLogger):
             logger_instance.close()
 
 
+def _is_v_schedule(pp_schedule: str) -> bool:
+    # V schedules put the last stage, which computes the loss, on pp rank 0.
+    # Keep in sync with _get_pp_rank_to_stage_indices_mapping in pipeline_parallel.py.
+    return get_schedule_class(pp_schedule) in (ScheduleZBVZeroBubble, ScheduleDualPipeV)
+
+
 def ensure_pp_loss_visible(
-    *, parallel_dims: ParallelDims, pp_schedule: str, color: Color | NoColor
+    *, parallelism_context: ParallelismContext, pp_schedule: str, color: Color | NoColor
 ) -> None:
     """
     Ensures that the loss is visible on the console for pipeline-parallel training.
@@ -237,12 +252,12 @@ def ensure_pp_loss_visible(
     """
 
     # V Block Schedules return loss on rank 0
-    if pp_schedule == "ZBVZeroBubble":
+    if _is_v_schedule(pp_schedule):
         return
 
     # Calculate the rank where loss is visible (first rank of the last pipeline stage)
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
+    world_size = parallelism_context.world_size
+    pp_size = parallelism_context.pp
     loss_visible_rank = (world_size // pp_size) * (pp_size - 1)
 
     # Check if the loss-visible rank is included in LOG_RANK environment variable
@@ -260,7 +275,7 @@ def ensure_pp_loss_visible(
 
 def _get_metrics_rank(
     *,
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
     pp_schedule: str,
 ) -> int:
     """
@@ -269,20 +284,20 @@ def _get_metrics_rank(
     Returns:
        int: The rank responsible for logging metrics:
             - Rank 0 for non-pipeline-parallel configs
-            - Rank 0 for pipeline-parallel 'ZBVZeroBubble' schedule
+            - Rank 0 for pipeline-parallel V schedules (ZBVZeroBubble, DualPipeV)
             - The first rank of the last pipeline stage for other pipeline-parallel schedules
     """
     # Early return for non-pipeline-parallel configurations
-    if not parallel_dims.pp_enabled:
+    if not parallelism_context.pp_enabled:
         return 0
 
     # V Block Schedules return loss on rank 0
-    if pp_schedule == "ZBVZeroBubble":
+    if _is_v_schedule(pp_schedule):
         return 0
 
     # Calculate first rank of the last pipeline stage
-    world_size = parallel_dims.world_size
-    pp_size = parallel_dims.pp
+    world_size = parallelism_context.world_size
+    pp_size = parallelism_context.pp
     return (world_size // pp_size) * (pp_size - 1)
 
 
@@ -294,7 +309,7 @@ class MetricsProcessor(Configurable):
 
     Args:
         config (Config): Metrics configuration.
-        parallel_dims (ParallelDims): Parallel dimensions.
+        parallelism_context (ParallelismContext): Parallel dimensions.
         device_memory_monitor (DeviceMemoryMonitor): Monitor supplied by the
             execution component that owns the device.
         dump_folder (str): Base folder for log output.
@@ -336,7 +351,7 @@ class MetricsProcessor(Configurable):
 
     config: Config
     logger: BaseLogger
-    parallel_dims: ParallelDims
+    parallelism_context: ParallelismContext
     device_memory_monitor: DeviceMemoryMonitor
     color: utils.NoColor | utils.Color
 
@@ -355,7 +370,7 @@ class MetricsProcessor(Configurable):
         self,
         config: Config,
         *,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         device_memory_monitor: DeviceMemoryMonitor,
         dump_folder: str = "./outputs",
         pp_schedule: str = "1F1B",
@@ -367,7 +382,7 @@ class MetricsProcessor(Configurable):
     ):
         self.logger = self._build_metric_logger(
             config=config,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             dump_folder=dump_folder,
             pp_schedule=pp_schedule,
             ft_enable=ft_enable,
@@ -375,7 +390,7 @@ class MetricsProcessor(Configurable):
             config_dict=config_dict,
             tag=tag,
         )
-        self.parallel_dims = parallel_dims
+        self.parallelism_context = parallelism_context
         self.config = config
         self.device_memory_monitor = device_memory_monitor
         # used for colorful printing
@@ -384,6 +399,8 @@ class MetricsProcessor(Configurable):
         self.gpu_peak_flops = utils.get_peak_flops(
             self.device_memory_monitor.device_name
         )
+        # Tokens, data-loading times and the timer cover the window since the
+        # last reset(), not only since the last log.
         self.ntokens_since_last_log = 0
         self.data_loading_times = []
         self.time_last_log = time.perf_counter()
@@ -406,7 +423,7 @@ class MetricsProcessor(Configurable):
         self,
         *,
         config: Config,
-        parallel_dims: ParallelDims,
+        parallelism_context: ParallelismContext,
         dump_folder: str,
         pp_schedule: str,
         ft_enable: bool = False,
@@ -430,7 +447,7 @@ class MetricsProcessor(Configurable):
         should_log = has_logging_enabled
         if (not config.save_for_all_ranks) and should_log:
             metrics_rank = _get_metrics_rank(
-                parallel_dims=parallel_dims, pp_schedule=pp_schedule
+                parallelism_context=parallelism_context, pp_schedule=pp_schedule
             )
             should_log = torch.distributed.get_rank() == metrics_rank
 
@@ -516,7 +533,7 @@ class MetricsProcessor(Configurable):
         performance = compute_training_performance_metrics(
             num_tokens=self.ntokens_since_last_log,
             elapsed_time=time_delta,
-            non_data_parallel_size=self.parallel_dims.non_data_parallel_size,
+            non_data_parallel_size=self.parallelism_context.non_data_parallel_size,
             num_flops_per_token=self.num_flops_per_token,
             gpu_peak_flops=self.gpu_peak_flops,
             has_quantization=self.has_quantization,
@@ -569,10 +586,18 @@ class MetricsProcessor(Configurable):
             f"{color.magenta}mfu: {mfu_str}{color.reset}"
         )
 
+        self.step_last_log = step
+
+    def reset(self) -> None:
+        """Start a new window for throughput, data-loading time and peak memory.
+
+        The trainer calls this right before training resumes after a log or a
+        validation, and validators call it before validating, so neither window
+        includes the other or a checkpoint saved at that step.
+        """
         self.ntokens_since_last_log = 0
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
-        self.step_last_log = step
         self.device_memory_monitor.reset_peak_stats()
 
     def log_validation(
@@ -584,7 +609,7 @@ class MetricsProcessor(Configurable):
 
         # tokens per second per device, abbreviated as tps
         tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
+            time_delta * self.parallelism_context.non_data_parallel_size
         )
 
         metrics = {
@@ -610,10 +635,7 @@ class MetricsProcessor(Configurable):
             f"{color.blue}tps: {round(tps):,}{color.reset}"
         )
 
-        self.ntokens_since_last_log = 0
-        self.time_last_log = time.perf_counter()
         self.step_last_log = step
-        self.device_memory_monitor.reset_peak_stats()
 
     def close(self):
         self.logger.close()

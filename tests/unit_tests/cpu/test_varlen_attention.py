@@ -14,19 +14,46 @@ from unittest.mock import patch
 import spmd_types as spmd
 import torch
 
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import _per_axis_types
 from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     GQAttention,
     QKVLinear,
+    VarlenAttentionMetadata,
     VarlenInnerAttention,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import ComplexRoPE
 
 
-class TestPackedVarlenMetadata(unittest.TestCase):
+class TestPackedVarlenAttentionMetadata(unittest.TestCase):
+    def test_spmd_annotation_includes_partition_spec(self):
+        metadata = VarlenAttentionMetadata(
+            cu_seq_q=torch.tensor([0, 2], dtype=torch.int32),
+            cu_seq_k=torch.tensor([0, 3], dtype=torch.int32),
+            max_q=2,
+            max_k=3,
+        )
+        expected_type = spmd.SpmdType(
+            {
+                MeshAxisName.DP: spmd.V,
+                MeshAxisName.TP: spmd.R,
+            },
+            partition_spec=spmd.PartitionSpec(MeshAxisName.DP),
+        )
+
+        with patch(
+            "torchtitan.models.common.attention.attention.spmd.assert_type"
+        ) as assert_type:
+            metadata.annotate_spmd_types()
+
+        self.assertEqual(assert_type.call_count, 2)
+        self.assertIs(assert_type.call_args_list[0].args[0], metadata.cu_seq_q)
+        self.assertIs(assert_type.call_args_list[1].args[0], metadata.cu_seq_k)
+        self.assertEqual(assert_type.call_args_list[0].args[1], expected_type)
+        self.assertEqual(assert_type.call_args_list[1].args[1], expected_type)
+
     def test_document_boundaries(self):
         positions_T = torch.tensor([0, 1, 2, 0, 1, 0, 1, 2, 3])
         metadata = create_varlen_metadata_for_document(positions_T)
@@ -108,7 +135,7 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
             return q_THK
 
         with patch(
-            "torchtitan.models.common.attention._varlen_attn",
+            "torchtitan.models.common.attention.attention._varlen_attn",
             side_effect=_identity_varlen,
         ):
             out_TD = attention(x_TD, metadata, positions_T)
@@ -116,10 +143,10 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
         self.assertEqual(out_TD.shape, x_TD.shape)
 
     def test_thk_thv_sharding_uses_varlen_argument_names(self):
-        from torchtitan.models.llama3 import llama3_configs
+        from torchtitan.models.llama3 import MODEL_FLAVORS
         from torchtitan.models.llama3.sharding import set_llama3_sharding_config
 
-        build_config, max_context_length = llama3_configs["debugmodel"]
+        build_config, max_context_length = MODEL_FLAVORS["debugmodel"]
         model_config = build_config("varlen", seq_len=max_context_length)
         set_llama3_sharding_config(model_config, enable_sp=False)
 
@@ -158,35 +185,35 @@ class TestPackedVarlenInnerAttention(unittest.TestCase):
             return out_THV
 
         with patch(
-            "torchtitan.models.common.attention._varlen_attn",
+            "torchtitan.models.common.attention.attention._varlen_attn",
             side_effect=_varlen_with_lse,
         ):
             out_THV = inner_attention(
                 q_THK,
                 q_THK,
                 q_THK,
-                attention_masks=metadata,
+                attention_metadata=metadata,
                 out_transform=_check_shapes,
             )
 
         self.assertEqual(out_THV.shape, q_THK.shape)
 
     def test_llama_decoder_preserves_td_shape(self):
-        from torchtitan.models.llama3 import llama3_configs
+        from torchtitan.models.llama3 import MODEL_FLAVORS
 
-        build_config, max_context_length = llama3_configs["debugmodel"]
+        build_config, max_context_length = MODEL_FLAVORS["debugmodel"]
         model = build_config("varlen", seq_len=max_context_length).build()
         model.init_states()
         num_tokens = 6
         tokens_T = torch.randint(0, 2048, (num_tokens,))
         positions_T = torch.tensor([0, 1, 0, 1, 2, 3])
-        metadata = model.get_attention_masks(positions_T)
+        metadata = model._get_attention_metadata(positions_T)
 
         def _identity_varlen(q_THK, k_THK, v_THV, *args, **kwargs):
             return q_THK
 
         with patch(
-            "torchtitan.models.common.attention._varlen_attn",
+            "torchtitan.models.common.attention.attention._varlen_attn",
             side_effect=_identity_varlen,
         ):
             logits_TV = model(tokens_T, positions_T, metadata)

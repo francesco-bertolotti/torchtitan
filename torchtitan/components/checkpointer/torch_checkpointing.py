@@ -43,16 +43,21 @@ from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.storage.base_storage import Storage, StorageConfig
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torchtitan.components.data.loader import BaseDataLoader
-from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer
+from torchtitan.components.optim import (  # noqa: N811
+    EMA as EMAContainer,
+    LRSchedulersContainer,
+    OptimizersContainer,
+)
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools import filesystem
-from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 from .base import (
     BaseCheckpointManager,
     DATALOADER,
+    EMA,
     LR_SCHEDULER,
     MODEL,
     ModelWrapper,
@@ -145,6 +150,11 @@ def _item_specs() -> dict[str, ItemSpec]:
             resharder=resharder,
             required=False,
         ),
+        EMA: ItemSpec(
+            requires_copy=True,
+            resharder=resharder,
+            required=False,
+        ),
     }
 
 
@@ -213,10 +223,10 @@ class TorchCheckpointingManager(BaseCheckpointManager):
 
     Args:
         storage_config: Backend storage for reading and writing checkpoints.
-            Defaults to the local filesystem. An init parameter rather than a
-            ``Config`` field because ``Configurable.Config`` is Tyro-parsed and
-            a backend storage object is not a command-line surface; callers that
-            need remote storage pass it programmatically.
+            Defaults to the local filesystem. This is an init parameter rather
+            than a ``Config`` field because the backend is a live storage object,
+            not declarative configuration; callers that need remote storage pass
+            it programmatically.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -231,6 +241,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
         model_parts: list[nn.Module],
         optimizers: OptimizersContainer,
         lr_schedulers: LRSchedulersContainer,
+        ema: EMAContainer | None,
         states: dict[str, Any],
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
@@ -263,6 +274,8 @@ class TorchCheckpointingManager(BaseCheckpointManager):
                 LR_SCHEDULER: lr_schedulers,
             }
         )
+        if ema is not None:
+            self.states[EMA] = ema
 
         self.load_only = config.load_only
         self.exclude_from_loading = config.exclude_from_loading
@@ -536,7 +549,7 @@ class TorchCheckpointingManager(BaseCheckpointManager):
             )
         finally:
             manager.close()
-        GarbageCollection.collect("GC collection invoked by checkpointer.")
+        GarbageCollector.collect("GC collection invoked by checkpointer.")
 
     def _should_prewarm(self) -> bool:
         return not self._prewarmed and not self.load_only

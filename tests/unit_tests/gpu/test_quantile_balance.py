@@ -16,20 +16,20 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
 )
 
-from torchtitan.components.optimizer import (
-    OptimizersContainer,
-    ParamGroupConfig,
-    register_moe_quantile_balancing_hook,
-)
-from torchtitan.distributed import ParallelDims
+from torchtitan.components.optim import AdamW, OptimizersContainer
+from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.spmd_types import set_current_spmd_mesh
-from torchtitan.models.common import RouterGateLinear, Sigmoid
+from torchtitan.models.common import HiMidLoLinear, Sigmoid
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
     token_id_placement,
 )
-from torchtitan.models.common.moe import MoE, QuantileBalancedTopKRouter
+from torchtitan.models.common.moe import (
+    MoE,
+    QuantileBalancedTopKRouter,
+    register_moe_quantile_balancing_hook,
+)
 from torchtitan.models.common.moe_sharding import _tokens_per_expert_placement
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 
@@ -48,7 +48,7 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
     @with_comms
     def test_distributed_quantile_balancing(self) -> None:
         device = torch.device(self.device_type, self.rank)
-        parallel_dims = ParallelDims(
+        parallelism_context = ParallelismContext(
             dp_replicate=1,
             dp_shard=self.world_size,
             cp=1,
@@ -56,9 +56,10 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
             pp=1,
             ep=self.world_size,
             world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
-        parallel_dims.build_mesh()
-        dense_mesh = parallel_dims.spmd_dense_mesh()
+        parallelism_context.build_mesh()
+        dense_mesh = parallelism_context.spmd_dense_mesh()
 
         model = nn.Module()
         moe_layers = []
@@ -66,7 +67,7 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
             router = QuantileBalancedTopKRouter.Config(
                 num_experts=4,
                 top_k=2,
-                gate=RouterGateLinear.Config(
+                gate=HiMidLoLinear.Config(
                     in_features=4,
                     out_features=4,
                     bias=False,
@@ -137,7 +138,7 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
                 )
                 spmd.assert_type(
                     router.tokens_per_expert_E,
-                    _tokens_per_expert_placement(enable_ep=True),
+                    _tokens_per_expert_placement(),
                 )
                 spmd.assert_type(
                     moe.expert_bias_E,
@@ -191,19 +192,19 @@ class TestQuantileBalancingDistributed(DTensorTestBase):
             )
 
         optimizers = OptimizersContainer.Config(
-            implementation="for-loop",
-            param_groups=[
-                ParamGroupConfig(
+            optimizers=[
+                AdamW.Config(
                     pattern=r".*",
-                    optimizer_name="AdamW",
-                    optimizer_kwargs={"lr": 0.0, "weight_decay": 0.0},
+                    lr=0.0,
+                    weight_decay=0.0,
+                    fused=False,
                 )
             ],
         ).build(model_parts=[model])
         register_moe_quantile_balancing_hook(
             optimizers,
             [model],
-            parallel_dims,
+            parallelism_context,
         )
 
         optimizers.step()

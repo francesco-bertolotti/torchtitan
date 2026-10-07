@@ -20,7 +20,7 @@ MoE models, so the two paths must match op-for-op.
 
 Batch-invariant mode is gated by `DebugConfig(batch_invariant=True,
 deterministic=True)` on both the trainer and generator configs. The shared
-toggle is `set_batch_invariance()` in `torchtitan/distributed/utils.py`, called
+toggle is `set_batch_invariance()` in `torchtitan/distributed/batch_invariant.py`, called
 from:
 
 - `torchtitan/rl/trainer.py` (trainer)
@@ -33,7 +33,7 @@ For the same input, the trainer and generator must run the same ops with the
 same accumulation order. Three groups of fixes make that hold.
 
 **Shared op overrides** -- applied by `set_batch_invariance()`
-(`torchtitan/distributed/utils.py`), which both actors call:
+(`torchtitan/distributed/batch_invariant.py`), which both actors call:
 
 - **`mm` / `addmm` / `_log_softmax` / `mean.dim`:** cuBLAS and the default
   reduction kernels pick tile/block schedules from the input shape, so the
@@ -44,19 +44,18 @@ same accumulation order. Three groups of fixes make that hold.
 - **Flash attention split-k:** FA3 picks `num_splits` from the sequence length,
   changing the partial-sum reduction tree. Forced to `num_splits=1` when
   `is_in_batch_invariant_mode()` is True
-  (`torchtitan/models/common/attention.py`, `VarlenInnerAttention.forward`); FA2 is
+  (`torchtitan/models/common/attention/attention.py`, `VarlenInnerAttention.forward`); FA2 is
   already batch-invariant.
 - **NCCL collectives:** all-reduce may use ring/tree algorithms with varying
   channel counts, reordering the cross-rank reduction. Forced to single-channel
-  tree (`NCCL_ALGO=allreduce:tree`, `NCCL_MIN/MAX_NCHANNELS=1`,
-  `NCCL_PROTO=Simple`, etc.) to match vLLM; must be set before
-  `dist.init_process_group`.
+  tree (`NCCL_ALGO=allreduce:tree`, `NCCL_MAX_NCHANNELS=1`); must be set
+  before `dist.init_process_group`.
 - **Reduced-precision reductions and TF32:** disabled
   (`allow_bf16/fp16_reduced_precision_reduction = False`,
   `torch.backends.cuda.matmul.allow_tf32 = False`,
   `torch.backends.cudnn.allow_tf32 = False`).
 
-**Generator-only patches** (`torchtitan/rl/batch_invariance.py`) --
+**Generator-only patches** (`torchtitan/rl/model/batch_invariance.py`) --
 the generator runs the same model inside vLLM, whose fused kernels must be routed
 back to the trainer's ops:
 
@@ -105,8 +104,8 @@ precision with FSDP mixed precision (`training.mixed_precision_param="bfloat16"`
 the default): it keeps fp32 master weights and FSDP's `MixedPrecisionPolicy`
 casts them to bf16 before the forward, so the forward is numerically identical to
 the generator's bf16 path. The trainer always wraps the model in FSDP
-(`parallelize_qwen3` applies `apply_fsdp_to_decoder` unconditionally for the
-trainer), so this cast happens even at `data_parallel_shard_degree=1`, where FSDP
+(`Decoder._apply_fsdp` applies `apply_fsdp_to_decoder` for the trainer), so this
+cast happens even at `data_parallel_shard_degree=1`, where FSDP
 acts purely as a mixed-precision boundary (the degree-1 all-gather is a no-op but
 still casts to bf16). No extra GPUs are required relative to TP-only. With
 `data_parallel_shard_degree > 1` the same cast happens during the sharded
@@ -131,12 +130,12 @@ Run a batch-invariant config via the RL entrypoint, e.g.:
 
 ```bash
 python -m torchtitan.rl.train \
-    --module alphabet_sort \
+    --module torchtitan_recipes.rl.alphabet_sort \
     --config rl_grpo_qwen3_0_6b_varlen_batch_invariant
 ```
 
 Batch-invariant configs in
-`torchtitan/rl/examples/alphabet_sort/config_registry.py` all use
+`torchtitan_recipes/rl/alphabet_sort.py` all use
 FSDP mixed precision (fp32 master weights, bf16-cast forward) on the trainer:
 
 ## Performance: cost of batch-invariant mode

@@ -16,12 +16,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import tyro
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
 
@@ -29,7 +28,7 @@ from torchtitan.config import Configurable, Function
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools import filesystem
-from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +38,7 @@ OPTIMIZER = "optimizer"
 LR_SCHEDULER = "lr_scheduler"
 DATALOADER = "dataloader"
 TRAIN_STATE = "train_state"
+EMA = "ema"
 
 
 def purge_thread(
@@ -283,7 +283,7 @@ class BaseCheckpointManager(Configurable, ABC):
                         )
                     logger.info(
                         "Loading HF safetensors from "
-                        f"--model.hf_assets_path: {checkpoint_id}"
+                        f"hf_assets_path: {checkpoint_id}"
                     )
                 else:
                     logger.info("No checkpoint was provided, this is a fresh start.")
@@ -322,7 +322,7 @@ class BaseCheckpointManager(Configurable, ABC):
                 from_hf=from_hf,
                 from_quantized=from_quantized,
             )
-            GarbageCollection.collect("GC collection for checkpoint loading.")
+            GarbageCollector.collect("GC collection for checkpoint loading.")
             logger.info(
                 "Finished loading the checkpoint in %.2f seconds.",
                 time.monotonic() - begin,
@@ -444,11 +444,12 @@ class BaseCheckpointManager(Configurable, ABC):
     def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
         """Whether automatic loading may select ``checkpoint_dir``."""
 
-    def _find_load_step(self, folder: str = "") -> int:
+    def _find_load_step(self, folder: str = "", max_step: int | None = None) -> int:
         """The highest step in ``folder`` that can actually be loaded.
 
         Args:
             folder: Directory to scan. Defaults to ``self.folder``.
+            max_step: Ignore checkpoints after this step when provided.
 
         Returns:
             The step number, or -1 when the folder holds no loadable checkpointer.
@@ -467,6 +468,8 @@ class BaseCheckpointManager(Configurable, ABC):
         for dirname in self._storage.listdir(folder):
             step = self._parse_step(dirname)
             if step is None:
+                continue
+            if max_step is not None and step > max_step:
                 continue
             if self._is_resumable_checkpoint(filesystem.join(folder, dirname)):
                 resumable_steps.append(step)
@@ -562,7 +565,7 @@ class BaseCheckpointManager(Configurable, ABC):
         keep_latest_k: int = 10
         """Number of recent checkpoints to retain, or zero to retain all."""
 
-        purge_exempt: Annotated[Function.Config | None, tyro.conf.Suppress] = None
+        purge_exempt: Function.Config | None = None
         """Optional predicate that exempts checkpoint steps from purging."""
 
         load_step: int = -1

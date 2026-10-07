@@ -13,9 +13,8 @@ To register TorchTitan models with vLLM:
 
     # Standalone inference (loads HF weights):
     register_to_vllm(
-        model_spec,
+        model_config,
         parallelism=parallelism_config,
-        compile_config=compile_config,
         checkpointer_config=CheckpointManager.Config(
             initial_load_in_hf=True,
             initial_load_path="/path/to/hf/checkpoint",
@@ -24,9 +23,8 @@ To register TorchTitan models with vLLM:
 
     # RL loop (skip HF loading, weights from TorchStore):
     register_to_vllm(
-        model_spec,
+        model_config,
         parallelism=parallelism_config,
-        compile_config=compile_config,
         checkpointer_config=None,
     )
 """

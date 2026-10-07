@@ -23,7 +23,7 @@ from typing import Literal, TYPE_CHECKING
 import spmd_types as spmd
 from spmd_types import SpmdType
 
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
@@ -35,12 +35,13 @@ from torchtitan.models.common.vision_encoder_sharding import (
     set_vision_transformer_block_sharding_config,
     vision_colwise_config,
     vision_invariant_linear_config,
-    vision_partial_bias_rowwise_config,
+    vision_rowwise_config,
 )
 from torchtitan.models.deepseek_v3.sharding import set_deepseek_v3_sharding_config
 from torchtitan.protocols.sharding import ShardingConfig
 
 DP = MeshAxisName.DP
+CP = MeshAxisName.CP
 TP = MeshAxisName.TP
 
 if TYPE_CHECKING:
@@ -94,7 +95,9 @@ def _shard_decoder_after_embedding_scatter(config: "KimiK25Model.Config") -> Non
 
 
 def set_moonvit_sharding_config(
-    ve_cfg, *, projector_norm: Literal["pre_norm", "post_norm"] = "pre_norm"
+    ve_cfg,
+    *,
+    projector_norm: Literal["pre_norm", "post_norm"] = "pre_norm",
 ) -> None:
     """Invariant-activation TP plan for the MoonViT3d vision encoder.
 
@@ -104,19 +107,19 @@ def set_moonvit_sharding_config(
     runs in distributed tensor space. ``projector_norm`` names the projector's
     norm: ``pre_norm`` in Kimi K2.5, ``post_norm`` in Kimi K3.
     """
+    state_placement = SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})
+    invariant_activation_placement = SpmdType({DP: spmd.V, CP: spmd.R, TP: spmd.I})
+    replicated_activation_placement = SpmdType({DP: spmd.V, CP: spmd.R, TP: spmd.R})
+
     # The encoder's own ``pos_embed`` table is invariant across TP ranks.
     ve_cfg.sharding_config = ShardingConfig(
-        state_shardings={
-            "pos_embed": SpmdType({DP: spmd.R, TP: spmd.I}),
-        },
-        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
+        state_shardings={"pos_embed": state_placement},
+        out_src_shardings=invariant_activation_placement,
+        out_dst_shardings=replicated_activation_placement,
     )
     ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
-        state_shardings={
-            "inv_freq": SpmdType({DP: spmd.R, TP: spmd.I}),
-        },
-        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
+        state_shardings={"inv_freq": state_placement},
+        out_src_shardings=state_placement,
     )
 
     ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
@@ -131,4 +134,4 @@ def set_moonvit_sharding_config(
     proj = ve_cfg.projector
     getattr(proj, projector_norm).sharding_config = invariant_norm_config()
     proj.linear_1.sharding_config = vision_colwise_config()
-    proj.linear_2.sharding_config = vision_partial_bias_rowwise_config()
+    proj.linear_2.sharding_config = vision_rowwise_config()

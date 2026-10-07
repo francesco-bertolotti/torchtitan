@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,19 +16,18 @@ import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchtitan.config import CompileConfig, Configurable
+from torchtitan.config import Configurable
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.distributed.local_compile import local_compile
 from torchtitan.distributed.spmd_types import current_spmd_mesh, spmd_mesh_size
-from torchtitan.distributed.utils import is_in_batch_invariant_mode
 
 # PyTorch's default ignore index for cross-entropy loss
-logger = logging.getLogger(__name__)
-
-
 IGNORE_INDEX = -100
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
 
 
+@local_compile("loss", batch_invariant=False)
 def cross_entropy_loss(
     pred: torch.Tensor,
     labels: torch.Tensor,
@@ -269,6 +267,7 @@ class _VocabParallelEntropy(torch.autograd.Function):
         return torch.log(sumexp) - weighted_sum / sumexp
 
 
+@local_compile("loss", batch_invariant=False)
 def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """MSE loss with sum reduction for Transformer models training."""
     return torch.nn.functional.mse_loss(
@@ -280,7 +279,7 @@ class BaseLoss(ABC, Configurable):
     """Abstract base class for all loss functions.
 
     Provides compile support and a unified ``__call__`` signature:
-    ``(pred, labels, global_valid_tokens) -> (scaled_loss, metrics)``.
+    ``(pred, labels, global_loss_token_counts) -> (scaled_loss, metrics)``.
     Subclasses must implement ``__init__``. Leaf losses set ``self.fn`` and
     reuse the default ``__call__``.
     """
@@ -292,34 +291,29 @@ class BaseLoss(ABC, Configurable):
         pass
 
     @abstractmethod
-    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+    def __init__(self, config: Config):
         ...
-
-    def _maybe_compile(self, compile_config: CompileConfig | None) -> None:
-        if compile_config is not None and "loss" in compile_config.components:
-            logger.info("Compiling the loss function with torch.compile")
-            self.fn = torch.compile(self.fn, backend=compile_config.backend)
 
     def __call__(
         self,
         pred: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None = None,
+        global_loss_token_counts: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Return the scaled loss and any metrics computed by the loss."""
         del kwargs
         loss = self.fn(pred, labels)
-        # loss: V->P, annotate global_valid_tokens
+        # loss: V->P, annotate global_loss_token_counts
         if current_spmd_mesh() is not None:
             spmd.assert_type(loss, {"dp": spmd.P, "cp": spmd.P})
-            if global_valid_tokens is not None:
+            if global_loss_token_counts is not None:
                 spmd.assert_type(
-                    global_valid_tokens,
+                    global_loss_token_counts,
                     {"dp": spmd.R, "cp": spmd.R, "tp": spmd.I},
                 )
-        if global_valid_tokens is not None:
-            loss = loss / global_valid_tokens
+        if global_loss_token_counts is not None:
+            loss = loss / global_loss_token_counts
         return loss, {}
 
 
@@ -331,30 +325,29 @@ class CrossEntropyLoss(BaseLoss):
         global_vocab_size: int | None = None
         """Full vocabulary size, needed for spmd_types loss-parallel CE."""
 
-    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+    def __init__(self, config: Config):
         self.fn: LossFunction = cross_entropy_loss
-        self._maybe_compile(compile_config)
         self.global_vocab_size = config.global_vocab_size
 
     def __call__(
         self,
         pred: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None = None,
+        global_loss_token_counts: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         del kwargs
         loss = self.fn(pred, labels, global_vocab_size=self.global_vocab_size)
-        # loss: V->P, annotate global_valid_tokens
+        # loss: V->P, annotate global_loss_token_counts
         if current_spmd_mesh() is not None:
             spmd.assert_type(loss, {"dp": spmd.P, "cp": spmd.P})
-            if global_valid_tokens is not None:
+            if global_loss_token_counts is not None:
                 spmd.assert_type(
-                    global_valid_tokens,
+                    global_loss_token_counts,
                     {"dp": spmd.R, "cp": spmd.R, "tp": spmd.I},
                 )
-        if global_valid_tokens is not None:
-            loss = loss / global_valid_tokens
+        if global_loss_token_counts is not None:
+            loss = loss / global_loss_token_counts
         return loss, {}
 
 
@@ -365,15 +358,16 @@ class MSELoss(BaseLoss):
     class Config(BaseLoss.Config):
         pass
 
-    def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
+    def __init__(self, config: Config):
         self.fn: LossFunction = mse_loss
-        self._maybe_compile(compile_config)
 
 
+@local_compile("loss", batch_invariant=False)
 def compute_logprobs(
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
+    vocab_parallel_group: dist.ProcessGroup | None,
     return_entropy: bool = False,
     global_vocab_size: int | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -381,11 +375,11 @@ def compute_logprobs(
 
     When ``return_entropy`` is set, also returns per-token Shannon entropy
     ``H(p) = logsumexp(logits) - sum(softmax(logits) * logits)``, with shape
-    ``[T]``. In a TP SPMD context, ``logits`` holds this rank's local vocab
-    shard. Batch-invariant mode gathers the shards so trainer and vLLM generator
-    perform the same operation sequence. Otherwise, ``global_vocab_size`` must
-    contain the full vocabulary size and statistics are computed directly from
-    the shards.
+    ``[T]``. ``vocab_parallel_group`` explicitly describes the logits layout:
+    a process group means that logits contain a local vocabulary shard, while
+    ``None`` means they contain the full vocabulary. Batch-invariant mode
+    gathers shards so trainer and vLLM generator perform the same operation
+    sequence. Otherwise, statistics are computed directly from the shards.
     Entropy is a metric only, so it is computed under ``no_grad``: it never
     contributes gradient and must not build an autograd graph over the logits
     softmax.
@@ -393,28 +387,25 @@ def compute_logprobs(
     Returns ``logprobs`` when ``return_entropy`` is False, else
     ``(logprobs, entropy)``.
     """
-    tp_size = spmd_mesh_size("tp")
-    if tp_size > 1:
+    if vocab_parallel_group is not None:
+        if global_vocab_size is None:
+            raise ValueError(
+                "global_vocab_size is required for vocab-parallel policy statistics"
+            )
         if not is_in_batch_invariant_mode():
-            if global_vocab_size is None:
-                raise ValueError(
-                    "global_vocab_size is required for vocab-parallel policy "
-                    "statistics"
-                )
-            logprobs = -cross_entropy_loss(
+            logprobs = -_LossParallelCrossEntropy.apply(
                 logits,
                 labels,
-                global_vocab_size=global_vocab_size,
-                reduction="none",
+                vocab_parallel_group,
+                global_vocab_size,
+                "none",
             )
             if not return_entropy:
                 return logprobs
             with torch.no_grad():
-                mesh = current_spmd_mesh()
-                assert mesh is not None
                 entropy = _VocabParallelEntropy.apply(
                     logits,
-                    mesh.get_group("tp"),
+                    vocab_parallel_group,
                 )
             return logprobs, entropy
 
@@ -425,13 +416,11 @@ def compute_logprobs(
         # all-reduce (R's backward), which would over-count by the TP degree.
         logits = spmd.redistribute(
             logits,
-            "tp",
+            vocab_parallel_group,
             src=spmd.S(-1),
             dst=spmd.I,
         )
 
-    # Outside the trainer's TP SPMD context logits are already replicated. This
-    # includes vLLM TP, which gathers full-vocabulary logits before this helper.
     # Single bf16->fp32 upcast, reused by both logprobs and (optionally) entropy.
     logits = logits.float()
     logprobs = -F.cross_entropy(
@@ -555,14 +544,9 @@ class ChunkedLossWrapper(BaseLoss):
         loss_fn: BaseLoss.Config = field(default_factory=CrossEntropyLoss.Config)
         """Loss applied to each chunk's logits."""
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        compile_config: CompileConfig | None = None,
-    ):
+    def __init__(self, config: Config):
         self.num_chunks = config.num_chunks
-        self.loss_fn: BaseLoss = config.loss_fn.build(compile_config=compile_config)
+        self.loss_fn: BaseLoss = config.loss_fn.build()
         self.lm_head: nn.Module | None = None
 
     def set_lm_head(self, lm_head: nn.Module) -> None:
@@ -573,7 +557,7 @@ class ChunkedLossWrapper(BaseLoss):
         self,
         pred: torch.Tensor | tuple[torch.Tensor, ...],
         labels: torch.Tensor | tuple[torch.Tensor, ...],
-        global_valid_tokens: torch.Tensor | None = None,
+        global_loss_token_counts: torch.Tensor | None = None,
         **loss_inputs: Any,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute chunked loss.
@@ -702,6 +686,11 @@ class ChunkedLossWrapper(BaseLoss):
                     key: chunks[chunk_index] if isinstance(chunks, tuple) else chunks
                     for key, chunks in input_chunks.items()
                 }
+                # TODO: compile lm_head together with loss_fn (only loss_fn is
+                # compiled today): frees the fp32 dlogits right after the split, 1.2 GiB per
+                # Qwen3-8B chunk. Blocked: compiling HiMidLoLinear rounds grad_weight to bf16
+                # (https://github.com/pytorch/pytorch/pull/197381). With FSDP2, fullgraph also
+                # fails at lm_head's hooks, which can't be traced.
                 logits = tuple(lm_head(h_chunk) for h_chunk in h_chunks)
                 if not is_multi_output:
                     logits = logits[0]
@@ -709,9 +698,11 @@ class ChunkedLossWrapper(BaseLoss):
                 chunk_loss, chunk_metrics = self.loss_fn(
                     logits,  # pyrefly: ignore[bad-argument-type]
                     label_chunks,  # pyrefly: ignore[bad-argument-type]
-                    global_valid_tokens,
+                    global_loss_token_counts,
                     **loss_inputs,
                 )
+                # Free logits before backward.
+                del logits
                 metrics = self._combine_chunk_metrics(metrics, chunk_metrics)
                 total_loss = total_loss + chunk_loss.detach()
 

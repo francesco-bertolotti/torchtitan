@@ -70,15 +70,15 @@ We look forward to your contributions!
 4. [Distributed checkpointing](https://discuss.pytorch.org/t/distributed-w-torchtitan-optimizing-checkpointing-efficiency-with-pytorch-dcp/211250) (including async checkpointing)
    - [Interoperable checkpoints](docs/checkpoint.md) which can be loaded directly into [`torchtune`](https://github.com/pytorch/torchtune) for fine-tuning
 5. `torch.compile` support
-6. [Float8](https://discuss.pytorch.org/t/distributed-w-torchtitan-enabling-float8-all-gather-in-fsdp2/209323) support ([how-to](torchtitan/quantization/float8.md))
-7. [MXFP8 training for dense and MoE models](torchtitan/quantization/mxfp8/README.md) on Blackwell GPUs.
+6. [Low-precision training](torchtitan/quantization/README.md) with [MXFP8](torchtitan/quantization/mxfp8/README.md) and [NVFP4](torchtitan/quantization/nvfp4/README.md)
+7. [Distributed MoE](torchtitan/models/common/dist_moe/README.md) with fused CuTe DSL dispatch, expert compute, and combine on Blackwell GPUs
 8. Supervised Fine-Tuning (SFT) with chat-formatted datasets
 9. DDP and HSDP
 10. [TorchFT](https://github.com/pytorch/torchft) integration
 11. Checkpointable data-loading, with the C4 dataset pre-configured (144M entries) and support for [custom datasets](torchtitan/components/data/README.md)
-12. Gradient accumulation, derived from `--training.num_tokens_per_train_step`
+12. Gradient accumulation, derived from `training.num_tokens_per_train_step` in the selected recipe
 13. Flexible learning rate scheduler (warmup-stable-decay)
-14. [BF16 optimizer states](torchtitan/components/optimizer/bf16_optimizer_states.md) for reduced memory usage
+14. [BF16 optimizer states](torchtitan/components/optim/bf16_optimizer_states.md) for reduced memory usage
 15. Loss, GPU memory, throughput (tokens/sec), TFLOPs, and MFU displayed and logged via [Tensorboard or Weights & Biases](/docs/metrics.md)
 16. [Debugging tools](docs/debugging.md) including CPU/GPU profiling, memory profiling, Flight Recorder, etc.
     - [Deterministic SDC replay](torchtitan/observability/silent_data_corruption.md)
@@ -91,17 +91,6 @@ We look forward to your contributions!
     - run vLLM inference with TorchTitan models (`torchtitan/rl/generate.py`)
 
 We report [performance](benchmarks/llama3_h100_202412_torchtitan.md) on up to 512 GPUs, and verify [loss converging](docs/converging.md) correctness of various techniques.
-
-### Dive into the code
-
-You may want to see how the model is defined or how parallelism techniques are applied. For a guided tour, see these files first:
-* [torchtitan/train.py](torchtitan/train.py) - the main training loop and high-level setup code
-* [torchtitan/models/llama3/model.py](torchtitan/models/llama3/model.py) - the Llama 3.1 model definition
-* [torchtitan/models/llama3/parallelize.py](torchtitan/models/llama3/parallelize.py) - helpers for applying Data Parallel, Tensor Parallel, activation checkpointing, and `torch.compile` to the model
-* [torchtitan/distributed/pipeline_parallel.py](torchtitan/distributed/pipeline_parallel.py) - helpers for applying Pipeline Parallel to the model
-* [torchtitan/components/checkpointer/dcp.py](torchtitan/components/checkpointer/dcp.py) - utils for saving/loading distributed checkpoints
-* [torchtitan/quantization/float8.py](torchtitan/quantization/float8.py) - utils for applying Float8 techniques
-
 
 ## Installation
 
@@ -120,7 +109,7 @@ pip install -r requirements.txt
 > **Note:** You can run directly from the source tree. If you need to import `torchtitan` as a package from elsewhere, install it in editable mode without re-resolving dependencies: `pip install -e . --no-deps`.
 
 `torchao` is not installed by the command above. It is only needed for the
-low-precision training recipes (float8, MXFP8, NVFP4), and it is deliberately
+low-precision training recipes (MXFP8 and NVFP4), and it is deliberately
 left out so that it does not get resolved independently of the `torch` you
 already have. Install a nightly matching your accelerator build when you need
 one, replacing `cu130` to match:
@@ -165,7 +154,7 @@ python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets 
 Llama 3 8B model locally on 8 GPUs
 
 ```bash
-MODULE=llama3 CONFIG=llama3_8b ./run_train.sh
+MODULE=torchtitan_recipes.models.llama3 CONFIG=llama3_8b ./run_train.sh
 ```
 
 ### Multi-Node Training
