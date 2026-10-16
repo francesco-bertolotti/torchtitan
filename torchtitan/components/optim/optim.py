@@ -112,15 +112,19 @@ class Optim(Configurable):
             self.ema.step(current_step)
         return grad_norm
 
-    def _update(self, loss: torch.Tensor) -> torch.Tensor:
-        """Clip gradients, check loss and gradient norm, then update parameters."""
-        grad_norm = dist_utils.clip_grad_norm_(
+    def _clip_grad_norm(self) -> torch.Tensor:
+        """Clip gradients to ``max_norm`` and return their total norm."""
+        return dist_utils.clip_grad_norm_(
             self.parameters,
             self.config.max_norm,
             foreach=True,
             pp_mesh=self.parallelism_context.get_optional_mesh("pp"),
             ep_enabled=self.parallelism_context.ep_enabled,
         )
+
+    def _update(self, loss: torch.Tensor) -> torch.Tensor:
+        """Clip gradients, check loss and gradient norm, then update parameters."""
+        grad_norm = self._clip_grad_norm()
         loss_is_finite = torch.isfinite(loss).all().to(torch.int32)
         if not self.parallelism_context.pp_enabled or self.pp_has_last_stage:
             loss_mesh = self.parallelism_context.get_optional_mesh("loss")
