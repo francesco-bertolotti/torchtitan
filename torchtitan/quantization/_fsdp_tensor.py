@@ -175,6 +175,7 @@ _FSDP_UNSHARDED_VIEW_OPS = {
     torch.ops.aten.alias.default,
     torch.ops.aten.as_strided.default,
     torch.ops.aten.detach.default,
+    torch.ops.aten.flatten.using_ints,
     torch.ops.aten.view.default,
 }
 
@@ -288,7 +289,7 @@ class _ShardedFSDPTensor(_FSDPTensorBase):
         del logical_metadata
         self._tensor = tensor
 
-    def __tensor_flatten__(self):
+    def __tensor_flatten__(self) -> tuple[list[str], tuple[Any, ...]]:
         return ["_tensor"], (self.dtype,)
 
     @classmethod
@@ -305,7 +306,7 @@ class _ShardedFSDPTensor(_FSDPTensorBase):
     # pyrefly: ignore [bad-param-name-override]
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
         del types
-        template = None
+        template: _ShardedFSDPTensor | None = None
         preserve_wrapper = func in _FSDP_SHARDED_OPS
 
         def unwrap(tensor: _ShardedFSDPTensor) -> torch.Tensor:
@@ -323,7 +324,18 @@ class _ShardedFSDPTensor(_FSDPTensorBase):
         if not preserve_wrapper:
             return output
         assert template is not None
-        return pytree.tree_map_only(torch.Tensor, type(template), output)
+        rewrap = template._rewrap
+
+        def wrap(tensor: torch.Tensor):
+            # Ensure the wrapper and inner tensor use the same inference mode
+            with torch.inference_mode(tensor.is_inference()):
+                return rewrap(tensor)
+
+        return pytree.tree_map_only(torch.Tensor, wrap, output)
+
+    def _rewrap(self, tensor: torch.Tensor) -> _ShardedFSDPTensor:
+        """Wrap an FSDP-sharded ``tensor`` like this parameter."""
+        return type(self)(tensor)
 
     def _build_operands(
         self,
@@ -441,7 +453,9 @@ class _ShardedFSDPTensor(_FSDPTensorBase):
             torch.no_grad(),
             # Refilling lifecycle-managed storage is not a user-visible tensor
             # mutation and must not invalidate saved-tensor version checks.
-            torch.autograd._unsafe_preserve_version_counter(unsharded_inner_tensors),
+            torch.autograd._unsafe_preserve_version_counter(
+                tuple(t for t in unsharded_inner_tensors if not t.is_inference())
+            ),
         ):
             refilled = self._build_operands(logical_tensor, out=existing)
         _validate_refilled_tensor_identity(
@@ -555,22 +569,30 @@ class _UnshardedFSDPTensor(_FSDPTensorBase):
             # everything else. Which one does not matter: they
             # share the unsharded tensor's device, layout, and pinning.
             layout_source = _unsharded_inner_tensors(operands)[0]
-            return _UnshardedFSDPTensor(
-                layout_source,
-                operands,
-                _logical_size=tensor.size(),
-                _logical_stride=tensor.stride(),
-                _logical_storage_offset=tensor.storage_offset(),
-                _logical_dtype=template.dtype,
-                _logical_device=template.device,
-                _logical_requires_grad=tensor.requires_grad,
-            )
+            # Ensure the wrapper and inner tensor use the same inference mode
+            with torch.inference_mode(template.is_inference()):
+                return _UnshardedFSDPTensor(
+                    layout_source,
+                    operands,
+                    _logical_size=tensor.size(),
+                    _logical_stride=tensor.stride(),
+                    _logical_storage_offset=tensor.storage_offset(),
+                    _logical_dtype=template.dtype,
+                    _logical_device=template.device,
+                    _logical_requires_grad=tensor.requires_grad,
+                )
 
         original_args, original_kwargs = args, kwargs or {}
         args, kwargs = pytree.tree_map_only(
             cls, unwrap, (original_args, original_kwargs)
         )
         assert template is not None
+        # vLLM records reload metadata immediately after model initialization
+        # by calling tensor.data.to("meta")
+        if func is torch.ops.aten.to.dtype_layout:
+            device = kwargs.get("device")
+            if device is not None and torch.device(device).type == "meta":
+                return func(*args, **kwargs)
         if func in _FSDP_UNSHARDED_FACTORY_OPS:
             kwargs["device"] = template.device
             return func(*args, **kwargs)

@@ -15,7 +15,8 @@ from typing import Any
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
+from torchtitan.components.checkpointer import DATALOADER
+from torchtitan.components.data.loader import DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.config import apply_overrides, Configurable
 from torchtitan.distributed import ParallelismContext, utils as dist_utils
@@ -27,12 +28,12 @@ from torchtitan.experiments.torchft.optimizer import (
     TorchFTOptim,
     TorchFTOptimizersContainer,
 )
+from torchtitan.models.base import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability.metrics import (
     build_device_memory_monitor,
     ensure_pp_loss_visible,
 )
-from torchtitan.protocols import BaseModel
 from torchtitan.tools import utils
 from torchtitan.trainer import Trainer
 from torchtitan.training_engine import TrainingEngine
@@ -79,6 +80,11 @@ class FaultTolerantTrainingEngine(TrainingEngine):
             global_ranks = list(range(first_rank, last_rank + 1))
 
         config = self.config
+        dist_utils.configure_nccl_for_ulysses(
+            self.model_config,
+            device_type=self.device.type,
+            comm_backend=config.comm.backend,
+        )
         topology = dist_utils.init_distributed(
             config.comm,
             enable_cpu_backend=config.training.enable_cpu_offload,
@@ -87,6 +93,15 @@ class FaultTolerantTrainingEngine(TrainingEngine):
             pipeline_parallel_degree=config.parallelism.pipeline_parallel_degree,
         )
         self.ft_manager = self.fault_tolerance.build()
+        if self.fault_tolerance.enable:
+            # TORCHFT_TIMEOUT_SEC overrides fault_tolerance.timeout_ms.
+            ft_timeout = self.ft_manager.manager._timeout.total_seconds()
+            if ft_timeout >= config.comm.train_timeout_seconds:
+                logger.warning(
+                    f"torchft manager timeout ({ft_timeout} s) should be below "
+                    f"comm.train_timeout_seconds ({config.comm.train_timeout_seconds}); "
+                    "a slow process group reconfiguration can otherwise abort the replica."
+                )
         self.parallelism_context = ParallelismContext.from_config(
             config.parallelism, topology, dump_folder=self.output_dir
         )
@@ -121,19 +136,18 @@ class FaultTolerantTrainingEngine(TrainingEngine):
     def _initialize_checkpointer(
         self,
         *,
-        dataloader: BaseDataLoader | None,
+        extra_states: dict[str, torch.distributed.checkpoint.stateful.Stateful] | None,
         sd_adapter: Any | None,
     ) -> None:
         checkpointer_config = self.config.checkpointer
         if checkpointer_config is None:
             return
         self.checkpointer = checkpointer_config.build(
-            dataloader=dataloader,
             model_parts=self.model_parts,
             optimizers=self.optim.optimizers,
             lr_schedulers=self.optim.lr_schedulers,
             ema=self.optim.ema,
-            states={"train_state": self},
+            extra_states={"train_state": self, **(extra_states or {})},
             sd_adapter=sd_adapter,
             base_folder=self.output_dir,
             ft_manager=self.ft_manager,
@@ -151,9 +165,7 @@ class FaultTolerantTrainer(Configurable):
     @record
     def __init__(self, config: Config):
         self.config = config
-        model_config = copy.deepcopy(config.model)
-        model_config.set_sharding_(config.parallelism)
-        config.model = model_config
+        config.model = copy.deepcopy(config.model)
         if config.override.imports:
             apply_overrides(config.override, config)
         model_config = config.model
@@ -244,7 +256,7 @@ class FaultTolerantTrainer(Configurable):
             )
 
         engine.initialize(
-            dataloader=self.dataloader,
+            extra_states={DATALOADER: self.dataloader},
             hf_assets_path=config.hf_assets_path,
             create_seed_checkpoint=config.create_seed_checkpoint,
         )
@@ -272,6 +284,8 @@ class FaultTolerantTrainer(Configurable):
 
         # Build validator if validation is configured
         if config.validator is not None:
+            if engine._forward_backward_cuda_graph_enabled:
+                logger.warning("TorchFT validation runs without CUDA graphs.")
             pp_schedule, pp_has_first_stage, pp_has_last_stage = (
                 (
                     engine.pp_schedule,
@@ -283,6 +297,7 @@ class FaultTolerantTrainer(Configurable):
             )
 
             self.validator = config.validator.build(
+                cuda_graph_enabled=False,
                 parallelism=config.parallelism,
                 job_config=config,
                 dp_world_size=dp_degree,

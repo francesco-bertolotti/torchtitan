@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -28,7 +29,14 @@ class BinaryActivationFn(Function[torch.Tensor], ABC):
         pass
 
     # recompile_limit=16: ~3 graphs per static F; DeepSeek-V3 at TP8 needs 10 (default 8).
-    @local_compile("fused_binary_activation", batch_invariant=True, recompile_limit=16)
+    # Backward stacks the gate and up gradients into [..., 2, F]. Both limits at 0 make Inductor write
+    # each gradient into its half, not one kernel that picks a half per element. Both are needed.
+    @local_compile(
+        "fused_binary_activation",
+        batch_invariant=True,
+        recompile_limit=16,
+        options={"max_pointwise_cat_inputs": 0, "max_complex_pointwise_cat_inputs": 0},
+    )
     def __call__(
         self, gate_up: torch.Tensor, *, offsets: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -167,6 +175,37 @@ class SwiGLU(BinaryActivationFn):
 
     def _activation_fn(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
         return F.silu(gate) * up
+
+
+class ClampedSwiGLU(BinaryActivationFn):
+    """Clamped SwiGLU with configurable sigmoid scale and input bound."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BinaryActivationFn.Config):
+        swiglu_alpha: float = 1.702
+        swiglu_limit: float = 7.0
+
+        def __post_init__(self) -> None:
+            if not math.isfinite(self.swiglu_alpha) or self.swiglu_alpha <= 0:
+                raise ValueError(
+                    "swiglu_alpha must be finite and positive, got "
+                    f"{self.swiglu_alpha}"
+                )
+            if not math.isfinite(self.swiglu_limit) or self.swiglu_limit <= 0:
+                raise ValueError(
+                    "swiglu_limit must be finite and positive, got "
+                    f"{self.swiglu_limit}"
+                )
+
+    def __init__(self, config: Config) -> None:
+        self.alpha = config.swiglu_alpha
+        self.limit = config.swiglu_limit
+
+    def _activation_fn(self, gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+        gate = gate.clamp(max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        silu = gate * torch.sigmoid(self.alpha * gate)
+        return torch.addcmul(silu, silu, up)
 
 
 # TODO: move to models/kimi_k3, its only user.
