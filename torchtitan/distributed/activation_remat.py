@@ -108,11 +108,17 @@ class ActivationRematConfig:
     ) -> None:
         """Checkpoint every transformer block of ``model`` with ``torch_remat``.
 
+        The blocks are the children of ``model.layers`` and, on models with
+        multi-token prediction, of ``model.mtp_layers`` (``mtp_layers.<id>``),
+        whose activations would otherwise all be retained for backward.
+
         Args:
-            model: Model whose ``layers`` children are the transformer blocks.
+            model: Model whose ``layers`` (and ``mtp_layers``) children are the
+                transformer blocks.
             saved_tensors_hooks: Optional callable returning the saved-tensor
                 hook pair for one block, given the block and its FQN
-                (``layers.<id>``), or None to leave that block unhooked. The
+                (``layers.<id>`` or ``mtp_layers.<id>``), or None to leave that
+                block unhooked. The
                 pair is passed to
                 ``torch_remat.checkpoint(saved_tensors_hooks=...)``: ``pack``
                 replaces each tensor the block retains for backward with an
@@ -126,8 +132,16 @@ class ActivationRematConfig:
                 around the block. See torchtitan/distributed/REMAT.md and
                 https://github.com/meta-pytorch/remat/blob/main/docs/offloading.md.
         """
-        layers = model.get_submodule("layers")
-        transformer_blocks = list(layers.named_children())
+        transformer_blocks = [
+            (f"layers.{layer_id}", block)
+            for layer_id, block in model.get_submodule("layers").named_children()
+        ]
+        mtp_layers = getattr(model, "mtp_layers", None)
+        if mtp_layers is not None:
+            transformer_blocks += [
+                (f"mtp_layers.{layer_id}", block)
+                for layer_id, block in mtp_layers.named_children()
+            ]
         if not transformer_blocks:
             logger.info(
                 "%s found no transformer blocks in this model part",
@@ -137,12 +151,11 @@ class ActivationRematConfig:
 
         # TODO: Validate unmatched patterns once validation can account for save
         # regions across all pipeline stages instead of only this model part.
-        for layer_id, transformer_block in transformer_blocks:
+        for base_fqn, transformer_block in transformer_blocks:
             assert isinstance(transformer_block, Module)
             transformer_block.configure_remat_regions(
                 self.save_regions, self.recompute_regions
             )
-            base_fqn = f"layers.{layer_id}"
             transformer_block.forward = remat.checkpoint(
                 region_name=base_fqn,
                 determinism_check=self.determinism_check,
