@@ -20,6 +20,8 @@ if TYPE_CHECKING:
         paged_chunk_gdn,
         recurrent_gdn,
         recurrent_gdn_decode,
+        ReplayState,
+        StateCheckpoints,
     )
     from attn_gym.linear._delta_rule.gate import _FusedGate, gate_transform
     from attn_gym.linear.context_parallel import (
@@ -28,18 +30,19 @@ if TYPE_CHECKING:
         ContextParallelRouting,
     )
     from attn_gym.linear.gdn.context_parallel import context_parallel_gdn
-    from attn_gym.linear.gdn.impl.cudnn import ChunkGdnCudnnPacked
+    from attn_gym.linear.gdn.impl.warpdrive import ChunkGdnWarpdrivePacked
     from attn_gym.linear.gdn.ops import _ChunkGDN
     from attn_gym.linear.kda import (
         bound_gate,
         chunk_kda,
+        copy_replay_tails,
         paged_chunk_kda,
         recurrent_kda_decode,
     )
     from attn_gym.linear.kda.context_parallel import context_parallel_kda
     from attn_gym.linear.kda.fwd.triton.l2norm_fwd import _L2Norm, l2norm
-    from attn_gym.linear.kda.impl.cudnn import ChunkKdaCudnn
     from attn_gym.linear.kda.impl.fused import _ChunkKDA
+    from attn_gym.linear.kda.impl.warpdrive import ChunkKdaWarpdrive
     from attn_gym.linear.kda.masking import _MaskRows
     from attn_gym.linear.short_conv import (
         causal_conv1d,
@@ -47,6 +50,7 @@ if TYPE_CHECKING:
         paged_causal_conv1d,
     )
     from attn_gym.linear.short_conv.cute import _ConfiguredShortConv, _ShortConv
+    from attn_gym.mla import paged_mla_decode
     from attn_gym.sparse import lightning_indexer
     from attn_gym.sparse.gather_attn import AuxRequest, gather_attn
 
@@ -63,11 +67,12 @@ __all__ = [
     "bound_gate",
     "causal_conv1d",
     "causal_conv1d_decode",
-    "ChunkGdnCudnnPacked",
-    "ChunkKdaCudnn",
+    "ChunkGdnWarpdrivePacked",
+    "ChunkKdaWarpdrive",
     "chunk_gdn",
     "chunk_kda",
     "context_parallel_conv_history",
+    "copy_replay_tails",
     "context_parallel_gdn",
     "context_parallel_kda",
     "ContextParallelRouting",
@@ -79,9 +84,12 @@ __all__ = [
     "paged_causal_conv1d",
     "paged_chunk_gdn",
     "paged_chunk_kda",
+    "paged_mla_decode",
     "recurrent_gdn",
     "recurrent_gdn_decode",
     "recurrent_kda_decode",
+    "ReplayState",
+    "StateCheckpoints",
     "is_missing_kernel",
     "require_attn_gym",
 ]
@@ -99,13 +107,14 @@ _EXPORTS = {
     "bound_gate": "attn_gym.linear.kda",
     "causal_conv1d": "attn_gym.linear.short_conv",
     "causal_conv1d_decode": "attn_gym.linear.short_conv",
-    "ChunkGdnCudnnPacked": "attn_gym.linear.gdn.impl.cudnn",
-    "ChunkKdaCudnn": "attn_gym.linear.kda.impl.cudnn",
+    "ChunkGdnWarpdrivePacked": "attn_gym.linear.gdn.impl.warpdrive",
+    "ChunkKdaWarpdrive": "attn_gym.linear.kda.impl.warpdrive",
     "chunk_gdn": "attn_gym.linear",
     "chunk_kda": "attn_gym.linear.kda",
     "context_parallel_conv_history": "attn_gym.linear.context_parallel",
     "context_parallel_gdn": "attn_gym.linear.gdn.context_parallel",
     "context_parallel_kda": "attn_gym.linear.kda.context_parallel",
+    "copy_replay_tails": "attn_gym.linear.kda",
     "ContextParallelRouting": "attn_gym.linear.context_parallel",
     "gate_transform": "attn_gym.linear._delta_rule.gate",
     "gather_attn": "attn_gym.sparse.gather_attn",
@@ -115,23 +124,27 @@ _EXPORTS = {
     "paged_causal_conv1d": "attn_gym.linear.short_conv",
     "paged_chunk_gdn": "attn_gym.linear",
     "paged_chunk_kda": "attn_gym.linear.kda",
+    "paged_mla_decode": "attn_gym.mla",
     "recurrent_gdn": "attn_gym.linear",
     "recurrent_gdn_decode": "attn_gym.linear",
     "recurrent_kda_decode": "attn_gym.linear.kda",
+    "ReplayState": "attn_gym.linear",
+    "StateCheckpoints": "attn_gym.linear",
 }
 
 
 # Import errors raised from inside attn_gym, keyed by the attn_gym module that
-# raised them. The package is installed, but a kernel backend it imports at
-# module import time (cutlass, triton, ...) is not available on this platform.
+# raised them, or by "<module>.<export>" for an export the module resolves on
+# first access. The package is installed, but a kernel backend it imports
+# (cutlass, triton, ...) is not available on this platform.
 _BACKEND_ERRORS: dict[str, ModuleNotFoundError] = {}
 
 
 def _raise_for(error: ModuleNotFoundError | None) -> NoReturn:
     """Raise for a missing export.
 
-    ``error`` is the backend error recorded for the export's module. Without
-    one, attn_gym itself is not installed.
+    ``error`` is the backend error recorded for the export or its module.
+    Without one, attn_gym itself is not installed.
     """
     if error is not None:
         # A fresh exception each time: re-raising the recorded instance would
@@ -141,7 +154,8 @@ def _raise_for(error: ModuleNotFoundError | None) -> NoReturn:
         ) from error
     raise ModuleNotFoundError(
         "Attention Gym kernels require attn_gym. "
-        "Install it with: python -m pip install 'attn-gym[linear,cudnn]==0.0.16'.",
+        "Install TorchTitan's pinned dependencies with: "
+        "python -m pip install -r requirements.txt.",
         name="attn_gym",
     )
 
@@ -172,15 +186,15 @@ class _MissingKernel:
 _BACKEND_KERNELS: dict[str, type[_MissingKernel]] = {}
 
 
-def _missing_backend_kernel(module_name: str) -> type[_MissingKernel]:
-    kernel = _BACKEND_KERNELS.get(module_name)
+def _missing_backend_kernel(key: str) -> type[_MissingKernel]:
+    kernel = _BACKEND_KERNELS.get(key)
     if kernel is None:
         kernel = type(
-            f"_MissingKernel[{module_name}]",
+            f"_MissingKernel[{key}]",
             (_MissingKernel,),
-            {"__module__": __name__, "_error": _BACKEND_ERRORS[module_name]},
+            {"__module__": __name__, "_error": _BACKEND_ERRORS[key]},
         )
-        _BACKEND_KERNELS[module_name] = kernel
+        _BACKEND_KERNELS[key] = kernel
     return kernel
 
 
@@ -189,15 +203,22 @@ def is_missing_kernel(kernel: object) -> TypeGuard[type[_MissingKernel]]:
     return isinstance(kernel, type) and issubclass(kernel, _MissingKernel)
 
 
+def _is_backend_error(error: ModuleNotFoundError) -> bool:
+    """Whether ``error`` is a kernel backend (cutlass, triton, ...) missing.
+
+    A missing attn_gym module (moved in a release, or a typo in _EXPORTS) is
+    breakage rather than an unsupported platform, so it is not deferred.
+    """
+    return error.name is not None and error.name.split(".")[0] != "attn_gym"
+
+
 def _load_module(name: str) -> ModuleType | None:
     try:
         return import_module(name)
     except ModuleNotFoundError as error:
         if error.name == "attn_gym":
             return None
-        if error.name is None or error.name.split(".")[0] == "attn_gym":
-            # An attn_gym module itself is missing (moved in a release, or a
-            # typo in _EXPORTS): that is breakage, so it stays loud.
+        if not _is_backend_error(error):
             raise
         # attn_gym is installed but this module needs a backend (cutlass,
         # triton, ...) that is not. Keep the models importable and report the
@@ -206,13 +227,39 @@ def _load_module(name: str) -> ModuleType | None:
         return None
 
 
+def _load_export(module: ModuleType, name: str) -> Any:
+    """Return ``module.<name>``, or a placeholder when its backend is missing.
+
+    attn_gym resolves backend-backed exports on first access (see
+    ``attn_gym.linear._lazy``) and wraps the backend's ModuleNotFoundError in
+    an ImportError, so for those the backend fails here, not in _load_module.
+    This relies on attn_gym raising that ImportError with ``from``: only
+    ``__cause__`` is inspected, an implicitly chained error (``__context__``)
+    raises at import.
+    """
+    try:
+        return getattr(module, name)
+    except ImportError as error:
+        cause = error.__cause__ or error
+        if not isinstance(cause, ModuleNotFoundError) or not _is_backend_error(cause):
+            raise
+        key = f"{module.__name__}.{name}"
+        # Keep attn_gym's message, which names the optional backend and how to
+        # get it, where the chained ModuleNotFoundError only says what import
+        # failed. The backend's name stays on the error for callers.
+        recorded = ModuleNotFoundError(str(error), name=cause.name, path=cause.path)
+        recorded.__cause__ = error
+        _BACKEND_ERRORS.setdefault(key, recorded)
+        return _missing_backend_kernel(key)
+
+
 def __getattr__(name: str) -> Any:
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name = _EXPORTS[name]
     module = _load_module(module_name)
     if module is not None:
-        value = getattr(module, name)
+        value = _load_export(module, name)
     elif module_name in _BACKEND_ERRORS:
         value = _missing_backend_kernel(module_name)
     else:

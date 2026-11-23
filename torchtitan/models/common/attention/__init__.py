@@ -11,6 +11,7 @@ from .attention import (  # noqa: F401
     Attention,
     create_attention_mask,
     create_varlen_metadata_for_document,
+    DeterministicVarlenInnerAttention,
     FlexAttentionMetadata,
     FlexInnerAttention,
     get_causal_mask_mod,
@@ -23,6 +24,7 @@ from .attention import (  # noqa: F401
     local_head_split,
     QKVLinear,
     SlidingWindowFlexInnerAttention,
+    SlidingWindowVarlenInnerAttention,
     VarlenAttentionMetadata,
     VarlenInnerAttention,
 )

@@ -12,10 +12,6 @@ from functools import partial
 import torch.nn as nn
 
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.transform import (
-    ModelConfigConverter,
-    validate_converter_compatibility,
-)
 
 from torchtitan.models.common.attention import VarlenInnerAttention
 from torchtitan.models.common.linear import Linear
@@ -109,7 +105,6 @@ def _make_double_block_config(
                 ),
             ),
             inner_attention=VarlenInnerAttention.Config(
-                window_size=(-1, -1),
                 sharding_config=flux_inner_attention_sharding_config(),
             ),
         ),
@@ -139,7 +134,6 @@ def _make_double_block_config(
                 ),
             ),
             inner_attention=VarlenInnerAttention.Config(
-                window_size=(-1, -1),
                 sharding_config=flux_inner_attention_sharding_config(),
             ),
         ),
@@ -168,7 +162,7 @@ def _make_double_block_config(
             param_init=_XAVIER_LINEAR,
         ),
         inner_attention=VarlenInnerAttention.Config(
-            window_size=(-1, -1), sharding_config=flux_inner_attention_sharding_config()
+            sharding_config=flux_inner_attention_sharding_config()
         ),
     )
 
@@ -217,12 +211,12 @@ def _make_single_block_config(
             ),
         ),
         inner_attention=VarlenInnerAttention.Config(
-            window_size=(-1, -1), sharding_config=flux_inner_attention_sharding_config()
+            sharding_config=flux_inner_attention_sharding_config()
         ),
     )
 
 
-def _flux_dev() -> FluxModel.Config:
+def _flux_dev(*, seq_len: int) -> FluxModel.Config:
     hidden_size = 3072
     num_heads = 24
     mlp_ratio = 4.0
@@ -244,6 +238,7 @@ def _flux_dev() -> FluxModel.Config:
         mlp_ratio=mlp_ratio,
     )
     return FluxModel.Config(
+        max_context_length=seq_len,
         in_channels=in_channels,
         out_channels=64,
         vec_in_dim=vec_in_dim,
@@ -336,7 +331,7 @@ def _flux_dev() -> FluxModel.Config:
     )
 
 
-def _flux_schnell() -> FluxModel.Config:
+def _flux_schnell(*, seq_len: int) -> FluxModel.Config:
     hidden_size = 3072
     num_heads = 24
     mlp_ratio = 4.0
@@ -358,6 +353,7 @@ def _flux_schnell() -> FluxModel.Config:
         mlp_ratio=mlp_ratio,
     )
     return FluxModel.Config(
+        max_context_length=seq_len,
         in_channels=in_channels,
         out_channels=64,
         vec_in_dim=vec_in_dim,
@@ -450,7 +446,7 @@ def _flux_schnell() -> FluxModel.Config:
     )
 
 
-def _flux_debug() -> FluxModel.Config:
+def _flux_debug(*, seq_len: int) -> FluxModel.Config:
     hidden_size = 1536
     num_heads = 12
     mlp_ratio = 4.0
@@ -472,6 +468,7 @@ def _flux_debug() -> FluxModel.Config:
         mlp_ratio=mlp_ratio,
     )
     return FluxModel.Config(
+        max_context_length=seq_len,
         in_channels=in_channels,
         out_channels=64,
         vec_in_dim=vec_in_dim,
@@ -565,26 +562,24 @@ def _flux_debug() -> FluxModel.Config:
 
 
 # The default lengths are ``_flux_seq_len(img_size, max_t5_encoding_len)`` for
-# the img_size / T5 length each shipped trainer config uses.
+# the img_size / T5 length each shipped trainer config uses. Unlike the decoders'
+# capability lengths, they are defaults, not caps.
 MODEL_FLAVORS = {
-    "flux-dev": _flux_dev,
-    "flux-schnell": _flux_schnell,
-    "flux-debug": _flux_debug,
+    "flux-dev": (_flux_dev, 768),
+    "flux-schnell": (_flux_schnell, 512),
+    "flux-debug": (_flux_debug, 512),
 }
 
 
 def build_model_config(
     flavor: str,
-    converters: list[ModelConfigConverter.Config] | None = None,
     *,
     parallelism: ParallelismConfig,
+    seq_len: int | None = None,
 ) -> FluxModel.Config:
     # Flux only declares CP sharding, which does not depend on the
     # parallelism settings; the argument keeps the builder API uniform.
     del parallelism
-    config = MODEL_FLAVORS[flavor]()
-    if converters is not None:
-        validate_converter_compatibility(converters)
-        for c in converters:
-            config = c.build().convert(config)
+    get_config, default_seq_len = MODEL_FLAVORS[flavor]
+    config = get_config(seq_len=seq_len or default_seq_len)
     return config
