@@ -27,7 +27,6 @@ from torchtitan.components.data.packing import (
     FirstFitPackingConfig,
 )
 from torchtitan.components.data.sources import (
-    ArrowDiskSource,
     HuggingFaceRandomAccessSource,
     HuggingFaceStreamingSource,
     IndexedJsonlSource,
@@ -42,7 +41,6 @@ from torchtitan.components.data.types import (
 )
 
 __all__ = [
-    "ArrowDiskSource",
     "Collator",
     "ConcatThenSplitPackingConfig",
     "DatasetBuildContext",
