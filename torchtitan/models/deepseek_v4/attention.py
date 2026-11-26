@@ -334,38 +334,43 @@ class DeepSeekV4Attention(Attention):
         compressor_128: Compressor.Config | None = None
         indexer: Indexer.Config | None = None
 
-        def flops_per_token(self, seq_len: int) -> int:
-            from torchtitan.models.common.flops import (
-                quadratic_attention_flops_per_token,
-            )
+        def flops(self, positions: torch.Tensor) -> int:
+            from torchtitan.models.common.flops import quadratic_attention_flops
 
             inner_attention = self.inner_attention
-            attention_op_flops = quadratic_attention_flops_per_token(
+            # A causal query at document position p attends to p + 1 keys,
+            # at most window_size of them uncompressed.
+            num_keys = positions + 1
+            attention_op_flops = quadratic_attention_flops(
                 num_heads=self.n_heads,
                 qk_head_dim=self.head_dim,
                 v_head_dim=self.head_dim,
-                seq_len=seq_len,
-                sliding_window_size=inner_attention.window_size,
+                num_keys=num_keys.clamp(max=inner_attention.window_size),
             )
 
             if self.compress_ratio > 1:
-                compressed_seq_len = seq_len // self.compress_ratio
+                num_compressed_keys = num_keys // self.compress_ratio
                 if self.compress_ratio == 4:
-                    attention_op_flops += (
-                        6
-                        * self.index_n_heads
-                        * self.index_head_dim
-                        * compressed_seq_len
-                    )
+                    # The indexer scores every compressed key without grad
+                    # (forward only); attention reads only the top-k.
+                    index_dim = self.index_n_heads * self.index_head_dim
+                    attention_op_flops += 2 * index_dim * int(num_compressed_keys.sum())
                     assert self.indexer is not None
-                    compressed_seq_len = min(
-                        compressed_seq_len, self.indexer.inner_indexer.topk
+                    num_compressed_keys = num_compressed_keys.clamp(
+                        max=self.indexer.inner_indexer.topk
                     )
-                attention_op_flops += quadratic_attention_flops_per_token(
+                    # The indexer loss recomputes the top-k scores with grad.
+                    # The forward repeats the scoring pass, so only the
+                    # backward is new work.
+                    if inner_attention.aux_loss is not None:
+                        attention_op_flops += (
+                            4 * index_dim * int(num_compressed_keys.sum())
+                        )
+                attention_op_flops += quadratic_attention_flops(
                     num_heads=self.n_heads,
                     qk_head_dim=self.head_dim,
                     v_head_dim=self.head_dim,
-                    seq_len=compressed_seq_len,
+                    num_keys=num_compressed_keys,
                 )
             return attention_op_flops
 

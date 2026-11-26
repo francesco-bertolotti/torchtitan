@@ -688,22 +688,32 @@ class QSAAttention(Qwen35Attention):
             ):
                 raise ValueError("Flash-Next QSA requires compress_ratio=4")
 
-        def flops_per_token(self, seq_len: int) -> int:
-            from torchtitan.models.common.flops import (
-                quadratic_attention_flops_per_token,
-            )
+        def flops(self, positions: torch.Tensor) -> int:
+            from torchtitan.models.common.flops import quadratic_attention_flops
 
-            attended_tokens = min(
-                seq_len, self.indexer.token_budget + self.indexer.compress_ratio - 1
-            )
-            return quadratic_attention_flops_per_token(
+            # A causal query at document position p can see p + 1 keys.
+            num_keys = positions + 1
+            num_compressed_keys = num_keys // self.indexer.compress_ratio
+            attention_flops = quadratic_attention_flops(
                 num_heads=self.n_heads,
                 qk_head_dim=self.head_dim,
                 v_head_dim=self.head_dim,
-                seq_len=attended_tokens,
-            ) + 6 * self.indexer.num_heads * self.indexer.head_dim * (
-                seq_len // self.indexer.compress_ratio
+                num_keys=num_keys.clamp(
+                    max=self.indexer.token_budget + self.indexer.compress_ratio - 1
+                ),
             )
+
+            # Scoring every compressed key runs without grad: forward only.
+            index_dim = self.indexer.num_heads * self.indexer.head_dim
+            indexer_flops = 2 * index_dim * int(num_compressed_keys.sum())
+            # The indexer loss recomputes the selected scores with grad. The
+            # forward repeats the scoring pass, so only the backward is new work.
+            if self.inner_attention.indexer_loss is not None:
+                num_selected_keys = num_compressed_keys.clamp(
+                    max=self.indexer.token_budget // self.indexer.compress_ratio
+                )
+                indexer_flops += 4 * index_dim * int(num_selected_keys.sum())
+            return attention_flops + indexer_flops
 
     def __init__(self, config: Config):
         super().__init__(config)
